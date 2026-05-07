@@ -1,0 +1,41 @@
+default:
+  recovery_frac_mass_H2O:
+    value: 1
+    units: dimensionless
+  energy_electric_flow_vol_inlet:
+    value: 0.00005  #todo is it correct?
+    units: kWh/m^3
+  capital_cost:
+    cost_factor: None
+    capital_a_parameter:
+      value: 290568
+      units: USD_2014
+    capital_b_parameter:
+      value: -1636000
+      units: USD_2014
+    capital_c_parameter:
+      value: 421505
+      units: USD_2014
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0
+      units: dimensionless
+      constituent_longform: "TOC"
+  initial_chlorine_demand:
+    value: 0
+    units: mg/L
+  contact_time:
+    value: 30
+    units: min
+  chlorine_dose:
+    value: 0.2
+    units: mg/L
+#  concentration_time:
+#    value: 450
+#    units: (mg*min)/L
+  chlorine_decay_rate:
+    value: 0.1 # post-GAC with TOC of 2 mg/L
+    units: 1/hr  #  Powell, J. C., Hallam, N. B., West, J. R., Forster, C. F., & Simms, J. (2000). Factors which control bulk chlorine decay rates. Water Research, 34(1), 117-126.

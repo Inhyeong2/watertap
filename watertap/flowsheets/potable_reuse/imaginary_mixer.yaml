@@ -1,0 +1,19 @@
+default:
+  energy_electric_flow_vol_inlet:
+    value: 0.0
+    units: kWh/m^3
+  recovery_frac_mass_H2O:
+    value: 1.0
+    units: dimensionless
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0
+      units: dimensionless
+      constituent_longform: Specific pollutant 1
+    tss:
+      value: 0
+      units: dimensionless
+      constituent_longform: Specific pollutant 2

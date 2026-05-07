@@ -1,0 +1,29 @@
+default:
+  recovery_frac_mass_H2O:
+    value: 1
+    units: dimensionless
+    reference: Texas Water Development Board IT3PR User Manual
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0
+      units: dimensionless
+      constituent_longform: Total Organic Carbon (TOC)
+  contact_time:
+    value: 5
+    units: min
+  mass_transfer_efficiency:
+    value: 1.0
+    units: dimensionless
+  specific_energy_coeff:
+    value: 5      
+    units: kWh/lb
+    reference: B. Mundy et al. (2018) doi.org/10.1080/01919512.2018.1467187 - Energy consumption 
+      for ozone generator, ozone destruct, nitrogen feed system, cooling water pumps, and other misc. energy uses.
+  O3toTOC:
+    value: 1
+    units: dimensionless
+  capital_cost:
+    cost_factor: None

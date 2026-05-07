@@ -1,0 +1,81 @@
+base_currency: USD_2020
+base_period: year
+defined_flows:
+  electricity:
+    value: 0.08
+    units: USD_2020/kWh
+  activated_carbon:
+    value: 3.764543  #$1.65 USD_2014/lb from Plumlee et al.
+    units: USD_2020/kg
+    purity: 1
+  membrane_replacement: # same with electricity
+    value: 0.08
+    units: USD_2020/kWh
+  lamp_replacement:
+    value: 0.00000652122   # Lamp replacement cost (M$_2014/day) = 0.00000630137 * MGD (from Plumlee et al.)
+    units: USD_2020/gallon
+  chlorine:
+    value: 0.34
+    units: USD_2020/kg
+    purity: 1
+  hydrogen_peroxide:
+    value: 1.53
+    units: USD_2020/kg
+    purity: 1
+  hypochlorite:  ## Operating cost (Mass flow rate of hypochlorite (kg/s) defined in uv_aop_DPR_zo * this value (USD2020/kg))
+                 ## should be equal to 1.65 * (Mass flow rate of h2o2 (kg/s) defined in uv_aop_DPR_zo * the above value (1.53 USD2020/kg))
+                 ## Therefore, here, the value and purity is assumed to be identical to H2O2 and the 1.65 was incoporated into the constraint
+                 ## in uv_aop_DPR_zo file.
+    value: 1.53
+    units: USD_2020/kg
+    purity: 1
+  brine_disposal:
+    value: 1
+    units: USD_2020/m**3
+  brine_recovery:
+    value: 1
+    units: USD_2020/m**3
+  recovered_water:
+    value: 0
+    units: USD_2020/m**3
+global_parameters:
+  plant_lifetime:
+    value: 30
+    units: year
+  utilization_factor:
+    value: 0.9
+    units: dimensionless
+  land_cost_percent_FCI:
+    value: 0
+    units: dimensionless
+  working_capital_percent_FCI:
+    value: 1.307  # 1.307+1 = 2.307 --> (1.3*equipment, which is defined as unit captial cost calculation) * 2.307 ~= 3
+                                    #                        (total capital == unit capital (without installation) * 3)
+    units: dimensionless
+  salaries_percent_FCI:
+    value: 0
+    units: 1/year
+  benefit_percent_of_salary:
+    value: 0
+    units: dimensionless
+  maintenance_costs_percent_FCI:
+    value: 0.04
+    units: 1/year
+  laboratory_fees_percent_FCI:
+    value: 0
+    units: 1/year
+  insurance_and_taxes_percent_FCI:
+    value: 0
+    units: 1/year
+  wacc:
+    # Weighted Average Cost of Capital (WACC)
+    value: 0.09307339771758532 #0.05
+    units: dimensionless
+  TPEC:
+    # Total Purchased Equipment Cost
+    value: 3.4
+    units: dimensionless
+  TIC:
+    # Total Installed Cost
+    value: 1.3
+    units: dimensionless

@@ -1,0 +1,27 @@
+default:
+  energy_electric_flow_vol_inlet:
+    value: 0.2642 # 1kWh/1000gal from Plumlee et al
+    units: kWh/m^3
+  capital_cost:
+    cost_factor: None
+  EBCT:
+    value: 15
+    units: min
+  required_BV:
+    value: 20000
+    units: dimensionless
+#  replacement_frequency:
+#    value: 0.5
+#    units: year
+  recovery_frac_mass_H2O:
+    value: 0.96
+    units: dimensionless
+    reference: Heap leaching (gold/copper) case study.
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0.43
+      units: dimensionless
+      constituent_longform: Total Organic Carbon (TOC)

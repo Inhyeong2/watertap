@@ -1,0 +1,21 @@
+default:
+  energy_electric_flow_vol_inlet:
+    value: 1.41003732 # Plumlee et al. Energy cost ($M/year) = 0.1509 * flow rate (MGD) --> 1.41003732 kWh/m3
+    units: kWh/m^3
+  energy_membrane_replacement_flow_vol_inlet:
+    value: 0.31396457 # Plumlee et al. Energy cost ($M/year) = 0.0336 * flow rate (MGD) --> 0.31396457 kWh/m3
+    units: kWh/m^3
+  capital_cost:
+    cost_factor: None
+  recovery_frac_mass_H2O:
+    value: 0.95
+    units: dimensionless
+    reference: Texas Water Development Board IT3PR User Manual
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0
+      units: dimensionless
+      constituent_longform: Total Organic Carbon (TOC)

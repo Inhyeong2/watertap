@@ -1,0 +1,28 @@
+default:
+  energy_electric_flow_vol_inlet:
+    value: 0.2642 # 1kWh/1000gal from Plumlee et al
+    units: kWh/m^3
+  capital_cost:
+    cost_factor: None
+  EBCT:
+    value: 20
+    units: min
+#  backwashing:
+#    value: 7
+#    units: 1/day
+#    reference:
+#  O3toTOC:
+#    value: 0.5
+#    units: dimensionless
+  recovery_frac_mass_H2O:
+    value: 0.99
+    units: dimensionless
+    reference: Defined based on the San Luis case study data.
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0.2
+      units: dimensionless
+      constituent_longform: Total Organic Carbon (TOC)

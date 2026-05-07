@@ -1,0 +1,26 @@
+default:
+  recovery_frac_mass_H2O:
+    value: 1
+    units: dimensionless
+  capital_cost:
+    cost_factor: None
+  default_removal_frac_mass_comp:
+    value: 0
+    units: dimensionless
+  removal_frac_mass_comp:
+    toc:
+      value: 0
+      units: dimensionless
+      constituent_longform: Total Organic Carbon (TOC)
+  uv_dose:
+    value: 1000
+    units: mJ/cm^2
+  hydrogen_peroxide_dose:
+    value: 5
+    units: mg/L
+#  chloramine_dose:
+#    value: 2.5
+#    units: mg/L
+  energy_electric_flow_vol_inlet:
+    value: 0.172867   # Plumlee et al. Energy cost ($M/year) = 0.0185 * flow rate (MGD) --> 0.172867 kWh/m3
+    units: kWh/m^3

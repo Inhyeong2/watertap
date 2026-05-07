@@ -1,0 +1,28 @@
+solutes:
+  TERTIARY:
+    toc:     { value: 10,   unit: "mg/L" }      # 10 mg/L
+    tds:     { value: 500,  unit: "mg/L" }      # 500 mg/L
+    nitrate: { value: 10,   unit: "mg/L" }     # as-N
+    nitrite: { value: 10,   unit: "mg/L" }     # as-N
+  SECONDARY:
+    toc:     { value: 10,    unit: "mg/L" }
+    tds:     { value: 1000,  unit: "mg/L" }
+    nitrate: { value: 10,    unit: "mg/L" }
+    nitrite: { value: 10,    unit: "mg/L" }
+
+state_requirements:
+  CA: { virus: 20, giardia: 14, crypto: 15, min_processes: 4 }
+  CO: { virus: 12, giardia: 10, crypto: 10, min_processes: 3 }
+  FL: { virus: 14, giardia: 12, crypto: 12, min_processes: 3 }
+  AZ: { virus: 14, giardia: 12, crypto: 12, min_processes: 3 }
+
+fixed_LRV:
+  BAC:    { virus: 0, giardia: 0, crypto: 0 }
+  UF:     { virus: 0, giardia: 4, crypto: 4 }
+  RO:     { virus: 2, giardia: 2, crypto: 2 }
+  GAC:    { virus: 0, giardia: 0, crypto: 0 }
+  UV-AOP: { virus: 6, giardia: 6, crypto: 6 }
+
+treatment_trains:
+  RBAT: ["Ozone", "BAC", "UF", "RO", "UV-AOP", "Cl2"]
+  CBAT: ["Ozone", "BAC", "UF", "GAC", "UV-AOP", "Cl2"]
