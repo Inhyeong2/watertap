@@ -1219,13 +1219,20 @@ def get_sweep_handles(m, treatment_train=None):
     # All of the following were verified (probe: perturb x0.9 -> re-solve -> LCOW
     # delta) to propagate: utilization_factor 8.0%, wacc 4.4%, TIC 4.1%,
     # plant_lifetime 1.3%, electricity_cost 1.1%.
-    costing = {
-        "electricity_cost": m.fs.zo_costing.electricity_cost,
-        "wacc": m.fs.zo_costing.wacc,
-        "plant_lifetime": m.fs.zo_costing.plant_lifetime,
-        "utilization_factor": m.fs.zo_costing.utilization_factor,
-        "TIC": m.fs.zo_costing.TIC,
-    }
+    #
+    # Costing handles only exist after ``add_costing`` has built the costing blocks.
+    # Guard on their presence so this function can also be called on a freshly built
+    # (pre-costing) model to resolve just the input/decision handles -- the rescue
+    # pass in DPR_sweep_v2 relies on this to apply input values before scaling.
+    costing = {}
+    if hasattr(m.fs, "zo_costing"):
+        costing.update({
+            "electricity_cost": m.fs.zo_costing.electricity_cost,
+            "wacc": m.fs.zo_costing.wacc,
+            "plant_lifetime": m.fs.zo_costing.plant_lifetime,
+            "utilization_factor": m.fs.zo_costing.utilization_factor,
+            "TIC": m.fs.zo_costing.TIC,
+        })
 
     if treatment_train == "RBAT":
         inputs["RO_A_comp"] = m.fs.RO_main.RO.A_comp[0, "H2O"]
@@ -1240,10 +1247,11 @@ def get_sweep_handles(m, treatment_train=None):
 
         # Verified to propagate: brine_disposal_cost 1.4%, membrane_cost 0.4%,
         # electricity_cost_ro 0.7%, utilization_factor_ro 0.8%.
-        costing["membrane_cost"] = m.fs.ro_costing.reverse_osmosis.membrane_cost
-        costing["electricity_cost_ro"] = m.fs.ro_costing.electricity_cost
-        costing["brine_disposal_cost"] = m.fs.zo_costing.brine_disposal_cost
-        costing["utilization_factor_ro"] = m.fs.ro_costing.utilization_factor
+        if hasattr(m.fs, "ro_costing"):
+            costing["membrane_cost"] = m.fs.ro_costing.reverse_osmosis.membrane_cost
+            costing["electricity_cost_ro"] = m.fs.ro_costing.electricity_cost
+            costing["brine_disposal_cost"] = m.fs.zo_costing.brine_disposal_cost
+            costing["utilization_factor_ro"] = m.fs.ro_costing.utilization_factor
     elif treatment_train == "CBAT":
         decisions["gac_ebct"] = m.fs.non_RO.GAC.EBCT[0]
         decisions["gac_required_BV"] = m.fs.non_RO.GAC.required_BV[0]
