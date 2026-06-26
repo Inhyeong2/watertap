@@ -799,7 +799,7 @@ def scale_system(m, treatment_train = None):
                                   1 / m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value / (1 - recovery))
         iscale.set_scaling_factor(RO_main.RO.permeate_side[0, 0].flow_vol_phase["Liq"],
                                   1 / m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value / recovery)
-        iscale.set_scaling_factor(RO_main.RO.permeate_side[0, 0].flow_vol_phase["Liq"],
+        iscale.set_scaling_factor(RO_main.RO.permeate_side[0, 1].flow_vol_phase["Liq"],
                                   1 / m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value / recovery)
 
         iscale.calculate_scaling_factors(RO_main.RO)
@@ -1398,9 +1398,9 @@ def add_costing(m, treatment_train=None):
             0 * m.fs.ro_costing.utilization_factor.value)  # utilization factor should be considered
                                                              # because it is not considered for fixed_operating_cost
                                                              # but it should be considered for flow_cost
-        m.fs.RO_main.pump.costing.costing_package.high_pressure_pump.cost.fix(
+        m.fs.RO_main.pump.costing.costing_package.high_pressure_pump.unit_cost.fix(
             53 / 1e5 * 3600 * m.fs.ro_costing.total_investment_factor.value)
-        m.fs.RO_main.ERD.costing.costing_package.energy_recovery_device.pressure_exchanger_cost.fix(
+        m.fs.RO_main.ERD.costing.costing_package.energy_recovery_device.unit_cost.fix(
             535 * m.fs.ro_costing.total_investment_factor.value)
 
         # RO_membrane_replacement_expr = Expression(
