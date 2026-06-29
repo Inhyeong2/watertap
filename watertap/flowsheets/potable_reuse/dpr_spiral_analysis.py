@@ -350,30 +350,34 @@ def run_rbat_cbat_combined(states=("CO", "FL"), rbat_cons_rec=0.40):
     RBAT's conservative case uses recovery = rbat_cons_rec (default 0.40)."""
     rbat_cons_case = f"Conserv rec={rbat_cons_rec:.2f}"
 
-    def _series(df, case):
-        d = df[df["case"] == case].dropna(subset=["LCOW"]).sort_values("flow_MGD")
-        return d["flow_MGD"], d["LCOW"]
+    def _series(df, case, ycol):
+        d = df[df["case"] == case].dropna(subset=[ycol]).sort_values("flow_MGD")
+        return d["flow_MGD"], d[ycol]
 
     for state in states:
         rb = pd.read_csv(os.path.join(OVC_DIR, f"optimal_vs_conserv_{state}.csv"))
         cb = pd.read_csv(os.path.join(OVC_DIR, f"optimal_vs_conserv_CBAT_{state}.csv"))
-        fig, ax = plt.subplots(figsize=(8, 6))
-        x, y = _series(rb, "Optimized")
-        ax.plot(x, y, color=RBAT_PT, ls="-", marker="o", ms=4, label="RBAT Optimized")
-        x, y = _series(rb, rbat_cons_case)
-        ax.plot(x, y, color=RBAT_PT, ls="--", marker="o", ms=4,
-                label=f"RBAT Conservative (rec={rbat_cons_rec:.2f})")
-        x, y = _series(cb, "Optimized")
-        ax.plot(x, y, color=CBAT_PT, ls="-", marker="s", ms=4, label="CBAT Optimized")
-        x, y = _series(cb, "Conservative")
-        ax.plot(x, y, color=CBAT_PT, ls="--", marker="s", ms=4, label="CBAT Conservative")
-        ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel("LCOW ($/m$^3$)")
-        ax.set_title(f"DPR {state}: RBAT vs CBAT -- Optimized vs Conservative\n"
-                     "LCOW vs system capacity")
-        ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
-        png = os.path.join(OVC_DIR, f"optimal_vs_conserv_RBATvsCBAT_{state}.png")
-        fig.savefig(png, dpi=150); plt.close(fig)
-        print("saved:", png)
+        for ycol, ylab, tag in [
+            ("LCOW", "LCOW ($/m$^3$)", ""),
+            ("capex_ratio", "CAPEX ratio [ann.CAPEX/(ann.CAPEX+OPEX)]", "_capexratio"),
+        ]:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            x, y = _series(rb, "Optimized", ycol)
+            ax.plot(x, y, color=RBAT_PT, ls="-", marker="o", ms=4, label="RBAT Optimized")
+            x, y = _series(rb, rbat_cons_case, ycol)
+            ax.plot(x, y, color=RBAT_PT, ls="--", marker="o", ms=4,
+                    label=f"RBAT Conservative (rec={rbat_cons_rec:.2f})")
+            x, y = _series(cb, "Optimized", ycol)
+            ax.plot(x, y, color=CBAT_PT, ls="-", marker="s", ms=4, label="CBAT Optimized")
+            x, y = _series(cb, "Conservative", ycol)
+            ax.plot(x, y, color=CBAT_PT, ls="--", marker="s", ms=4, label="CBAT Conservative")
+            ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel(ylab)
+            ax.set_title(f"DPR {state}: RBAT vs CBAT -- Optimized vs Conservative\n"
+                         f"{ycol} vs system capacity")
+            ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
+            png = os.path.join(OVC_DIR, f"optimal_vs_conserv_RBATvsCBAT_{state}{tag}.png")
+            fig.savefig(png, dpi=150); plt.close(fig)
+            print("saved:", png)
 
 
 # ===========================================================================
