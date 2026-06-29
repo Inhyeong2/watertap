@@ -22,12 +22,26 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pyomo.environ import value, check_optimal_termination
+from pyomo.environ import value, check_optimal_termination, units as pyunits
 from pyomo.util.calc_var_value import calculate_variable_from_constraint
 import watertap.flowsheets.potable_reuse.DPR_flowsheet_v2_spiral as dpr
 from watertap.flowsheets.potable_reuse.plot_monte_carlo import plot_flow_vs_lcow
 
 MGD = 0.0438126
+
+
+def _capex_ratio(m, train):
+    """annualized_capex / (annualized_capex + opex).
+    annualized_capex = total_capital_cost * CRF (same annualization as LCOW; zo CRF == ro CRF).
+    opex = total_operating_cost (+ brine_disposal_cost for RBAT -- in this model brine disposal
+    sits in total_externalities, not total_operating_cost, so it must be added explicitly)."""
+    yr = pyunits.USD_2020 / pyunits.year
+    ann_capex = value(pyunits.convert(
+        m.fs.total_capital_cost * m.fs.zo_costing.capital_recovery_factor, to_units=yr))
+    opex = value(pyunits.convert(m.fs.total_operating_cost, to_units=yr))
+    if train == "RBAT":
+        opex += value(pyunits.convert(m.fs.brine_disposal_cost, to_units=yr))
+    return ann_capex / (ann_capex + opex)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 OVC_DIR = os.path.join(_HERE, "output", "optimal_vs_conserv")   # opt-vs-conserv outputs
 MC_DIR = os.path.join(_HERE, "output", "monte_carlo")           # Monte Carlo outputs
@@ -76,20 +90,21 @@ def _rbat_point(flow_mgd, recovery, state, tds=0.5):
         RO.recovery_vol_phase[0, "Liq"].fix(recovery)
         res = dpr.solve(m)
     Ja = value(RO.mixed_permeate[0].flow_vol_phase["Liq"]) / value(RO.area) * 3.6e6
-    return check_optimal_termination(res), value(m.fs.LCOW), value(RO.recovery_vol_phase[0, "Liq"]), Ja
+    cr = _capex_ratio(m, "RBAT")
+    return check_optimal_termination(res), value(m.fs.LCOW), value(RO.recovery_vol_phase[0, "Liq"]), Ja, cr
 
 
 def _rbat_rescue(flow_mgd, recovery, state):
     last = None
     for eps in PERTURB:
         try:
-            ok, lcow, rec, flux = _rbat_point(flow_mgd * (1 + eps), recovery, state)
+            ok, lcow, rec, flux, cr = _rbat_point(flow_mgd * (1 + eps), recovery, state)
             if ok:
-                return lcow, rec, flux
-            last = (lcow, rec, flux)
+                return lcow, rec, flux, cr
+            last = (lcow, rec, flux, cr)
         except Exception:
             last = None
-    return (float("nan"), float("nan"), float("nan")) if last is None else (float("nan"), last[1], last[2])
+    return (float("nan"),) * 4 if last is None else (float("nan"), last[1], last[2], last[3])
 
 
 def run_rbat_opt_vs_conserv(states=RBAT_STATES):
@@ -100,23 +115,28 @@ def run_rbat_opt_vs_conserv(states=RBAT_STATES):
         csv = os.path.join(OVC_DIR, f"optimal_vs_conserv_{state}.csv")
         for label, rec in RBAT_CASES:
             for f in FLOWS_MGD:
-                lcow, r, flux = _rbat_rescue(f, rec, state)
+                lcow, r, flux, cr = _rbat_rescue(f, rec, state)
                 rows.append({"state": state, "case": label, "recovery_target": rec,
-                             "flow_MGD": f, "LCOW": lcow, "recovery": r, "flux_LMH": flux})
-                print(f"[{state}][{label:18s}] {f:4d} MGD -> LCOW={lcow:.4f} recov={r:.3f} flux={flux:.1f}")
+                             "flow_MGD": f, "LCOW": lcow, "recovery": r, "flux_LMH": flux,
+                             "capex_ratio": cr})
+                print(f"[{state}][{label:18s}] {f:4d} MGD -> LCOW={lcow:.4f} recov={r:.3f} "
+                      f"flux={flux:.1f} capexR={cr:.3f}")
                 pd.DataFrame(rows).to_csv(csv, index=False)
         df = pd.DataFrame(rows)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        for label, _ in RBAT_CASES:
-            d = df[df["case"] == label].dropna(subset=["LCOW"]).sort_values("flow_MGD")
-            ax.plot(d["flow_MGD"], d["LCOW"], marker="o", label=label)
-        ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel("LCOW ($/m$^3$)")
-        ax.set_title(f"DPR RBAT ({state}): Optimized vs Conservative (recovery-stepped)\n"
-                     "LCOW vs system capacity")
-        ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
-        png = os.path.join(OVC_DIR, f"optimal_vs_conserv_{state}.png")
-        fig.savefig(png, dpi=150); plt.close(fig)
-        print("saved:", csv, "|", png)
+        for ycol, ylab, tag in [("LCOW", "LCOW ($/m$^3$)", ""),
+                                ("capex_ratio", "CAPEX ratio [ann.CAPEX/(ann.CAPEX+OPEX)]", "_capexratio")]:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            for label, _ in RBAT_CASES:
+                d = df[df["case"] == label].dropna(subset=[ycol]).sort_values("flow_MGD")
+                ax.plot(d["flow_MGD"], d[ycol], marker="o", label=label)
+            ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel(ylab)
+            ax.set_title(f"DPR RBAT ({state}): Optimized vs Conservative (recovery-stepped)\n"
+                         f"{ycol} vs system capacity")
+            ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
+            png = os.path.join(OVC_DIR, f"optimal_vs_conserv_{state}{tag}.png")
+            fig.savefig(png, dpi=150); plt.close(fig)
+            print("saved:", png)
+        print("saved:", csv)
 
 
 # ===========================================================================
@@ -165,21 +185,22 @@ def _cbat_point(flow_mgd, conservative, state, tds=0.5):
         nz.GAC.required_BV[0].fix()
         res = dpr.solve(m)
     eff_toc = value(m.fs.treated_nonRO.properties[0].conc_mass_comp["toc"]) * 1000
+    cr = _capex_ratio(m, "CBAT")
     return (check_optimal_termination(res), value(m.fs.LCOW),
-            value(nz.GAC.EBCT[0]), value(nz.GAC.removal_frac_mass_comp[0, "toc"]), eff_toc)
+            value(nz.GAC.EBCT[0]), value(nz.GAC.removal_frac_mass_comp[0, "toc"]), eff_toc, cr)
 
 
 def _cbat_rescue(flow_mgd, conservative, state):
     last = None
     for eps in PERTURB:
         try:
-            ok, lcow, gac, grem, etoc = _cbat_point(flow_mgd * (1 + eps), conservative, state)
+            ok, lcow, gac, grem, etoc, cr = _cbat_point(flow_mgd * (1 + eps), conservative, state)
             if ok:
-                return lcow, gac, grem, etoc
-            last = (lcow, gac, grem, etoc)
+                return lcow, gac, grem, etoc, cr
+            last = (lcow, gac, grem, etoc, cr)
         except Exception:
             last = None
-    return (float("nan"),) * 4 if last is None else (float("nan"), last[1], last[2], last[3])
+    return (float("nan"),) * 5 if last is None else (float("nan"), last[1], last[2], last[3], last[4])
 
 
 def run_cbat_opt_vs_conserv(states=CBAT_STATES):
@@ -190,23 +211,27 @@ def run_cbat_opt_vs_conserv(states=CBAT_STATES):
         csv = os.path.join(OVC_DIR, f"optimal_vs_conserv_CBAT_{state}.csv")
         for label, cons in CBAT_CASES:
             for f in FLOWS_MGD:
-                lcow, gac, grem, etoc = _cbat_rescue(f, cons, state)
+                lcow, gac, grem, etoc, cr = _cbat_rescue(f, cons, state)
                 rows.append({"state": state, "case": label, "flow_MGD": f, "LCOW": lcow,
-                             "gac_EBCT": gac, "gac_removal": grem, "eff_TOC_mgL": etoc})
+                             "gac_EBCT": gac, "gac_removal": grem, "eff_TOC_mgL": etoc,
+                             "capex_ratio": cr})
                 print(f"[{state}][{label:12s}] {f:4d} MGD -> LCOW={lcow:.4f} "
-                      f"gacEBCT={gac:.1f} gacRem={grem:.3f} effTOC={etoc:.2f}")
+                      f"gacEBCT={gac:.1f} gacRem={grem:.3f} effTOC={etoc:.2f} capexR={cr:.3f}")
                 pd.DataFrame(rows).to_csv(csv, index=False)
         df = pd.DataFrame(rows)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        for label, _ in CBAT_CASES:
-            d = df[df["case"] == label].dropna(subset=["LCOW"]).sort_values("flow_MGD")
-            ax.plot(d["flow_MGD"], d["LCOW"], marker="o", label=label)
-        ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel("LCOW ($/m$^3$)")
-        ax.set_title(f"DPR CBAT ({state}): Optimized vs Conservative\nLCOW vs system capacity")
-        ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
-        png = os.path.join(OVC_DIR, f"optimal_vs_conserv_CBAT_{state}.png")
-        fig.savefig(png, dpi=150); plt.close(fig)
-        print("saved:", csv, "|", png)
+        for ycol, ylab, tag in [("LCOW", "LCOW ($/m$^3$)", ""),
+                                ("capex_ratio", "CAPEX ratio [ann.CAPEX/(ann.CAPEX+OPEX)]", "_capexratio")]:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            for label, _ in CBAT_CASES:
+                d = df[df["case"] == label].dropna(subset=[ycol]).sort_values("flow_MGD")
+                ax.plot(d["flow_MGD"], d[ycol], marker="o", label=label)
+            ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel(ylab)
+            ax.set_title(f"DPR CBAT ({state}): Optimized vs Conservative\n{ycol} vs system capacity")
+            ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
+            png = os.path.join(OVC_DIR, f"optimal_vs_conserv_CBAT_{state}{tag}.png")
+            fig.savefig(png, dpi=150); plt.close(fig)
+            print("saved:", png)
+        print("saved:", csv)
 
 
 # ===========================================================================

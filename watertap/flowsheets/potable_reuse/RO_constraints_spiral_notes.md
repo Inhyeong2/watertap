@@ -453,6 +453,47 @@ RBAT는 worst/best 간격이 상대적으로 좁다.
 
 ---
 
+## 13. CAPEX ratio (optimal vs conservative)
+
+LCOW 외에 자본/운영비 구성비를 보는 지표. opt-vs-conserv 비교(§10/§11)에 추가됨.
+
+### 13.1 정의
+```
+capex_ratio = annualized_capex / (annualized_capex + opex)
+annualized_capex = total_capital_cost × CRF
+opex            = total_operating_cost  ( + brine_disposal_cost,  RBAT만 )
+```
+- **CRF (Capital Recovery Factor) = 0.10000** (WACC 9.31%, plant lifetime 30년).
+  `CRF = i(1+i)^n / ((1+i)^n − 1)`. zo·ro costing의 WACC·수명이 동일하게 설정돼 **zo CRF = ro CRF**
+  → `total_capital_cost × zo CRF`로 연환산(LCOW 분자의 capex 항과 동일 방식).
+- **RBAT는 opex에 `brine_disposal_cost`를 명시적으로 더한다.** 이 모델에서 brine disposal은
+  `total_operating_cost`가 아니라 `total_externalities`에 들어있기 때문(§코드 line 1554/1593).
+  CBAT는 brine 없음 → opex = total_operating_cost.
+- 구현: `dpr_spiral_analysis._capex_ratio(m, train)`. CSV에 `capex_ratio` 열, 그래프
+  `optimal_vs_conserv_<...>_capexratio.png`.
+
+### 13.2 결과 (대표값)
+RBAT (CA; CO/FL는 RBAT에선 거의 동일):
+| 용량 | Opt | 0.45 | 0.40 | 0.35 | 0.30 |
+|---|---|---|---|---|---|
+| 10 MGD | 0.423 | 0.449 | 0.436 | 0.424 | 0.412 |
+| 50 MGD | 0.319 | 0.337 | 0.323 | 0.311 | 0.299 |
+| 100 MGD | 0.275 | 0.292 | 0.279 | 0.266 | 0.255 |
+
+CBAT (50 MGD): CO Opt 0.334 / Cons 0.303 ; FL Opt 0.304 / Cons 0.297.
+
+### 13.3 관찰
+- **규모↑ → capex_ratio↓**: 소규모 ~0.7(CAPEX-heavy) → 대규모 ~0.25(OPEX-heavy). 규모의 경제로
+  CAPEX가 분산되어 OPEX 비중이 커짐.
+- **recovery↓ → capex_ratio↓** (RBAT): 낮은 recovery는 brine disposal·feed 비례 OPEX를 키움.
+- **CBAT: CO는 opt↔cons capex_ratio gap이 크고(~0.03), FL은 거의 0.** 원인은 **규제 LRV 차이**
+  (FL: ozone crypto LRV 2 / Cl virus 2 > CO: 1 / 1). FL은 LRV가 높아 **최적화해도 ozone·Cl 소독을
+  많이** 써야 함 → optimized가 이미 OPEX-heavy → conservative(소독 최대 강제)와 비용구조가 비슷
+  → gap 작음. CO는 LRV가 낮아 optimized가 소독을 아껴 CAPEX-heavy → conservative와 gap 큼.
+  (RBAT은 RO recovery·brine이 capex_ratio를 지배해 LRV 영향이 묻혀 CO=FL로 동일.)
+
+---
+
 ## 참고 문헌 / 출처
 
 - FILMTEC™ Membrane System Design Guidelines for Commercial Elements
