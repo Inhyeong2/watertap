@@ -45,7 +45,13 @@ from parameter_sweep import (
     parameter_sweep,
 )
 from idaes.core.util.model_statistics import degrees_of_freedom
-import watertap.flowsheets.potable_reuse.DPR_flowsheet_v2 as dpr
+# Spiral RO + added RO design constraints (flux<=20 LMH, v_exit>=0.1, length 6-8).
+# This sweep is identical to DPR_sweep_v2 except it builds the spiral flowsheet, so the
+# RBAT LCOW reflects the spiral/constrained RO. Output files carry a distinct tag so they
+# do not overwrite the flat-RO Monte Carlo results.
+import watertap.flowsheets.potable_reuse.DPR_flowsheet_v2_spiral as dpr
+
+TAG = "ROspiral_add_const"
 
 MGD = 0.0438126  # m3/s per MGD
 
@@ -639,7 +645,7 @@ def run_monte_carlo_multistate(
         if verbose:
             print(f"\n=== Monte Carlo: state={state}, train={treatment_train} ===")
         csv = os.path.join(
-            output_dir, f"mc_v2_{state}_{treatment_train}_n{num_samples}.csv"
+            output_dir, f"mc_v2_{state}_{treatment_train}_{TAG}_n{num_samples}.csv"
         )
         _gr, csv_path, _png = run_monte_carlo(
             state=state,
@@ -680,29 +686,16 @@ def run_monte_carlo_multistate(
 
 
 if __name__ == "__main__":
-    # CBAT (non-RO) Monte Carlo for CO / FL on the SAME 1000 random input samples
-    # (feed_flow 1-100 MGD, feed TOC 7-15 mg/L; feed TDS fixed at 500 mg/L). One CSV and
-    # one PNG per state, written to OUTPUT_DIR/monte_carlo. The CBAT CSV has no
-    # brine_disposal_cost column, so the flow-vs-LCOW plot falls back to a single color.
+    # SPIRAL RO + added RO constraints: RBAT Monte Carlo for CA / CO / FL on the SAME 1000
+    # random input samples (feed_flow 1-100 MGD, feed TOC 7-15 mg/L, feed TDS 0.5-1.0 kg/m3,
+    # brine_disposal_cost 0.05-0.66 -- the default RBAT config). Files tagged with TAG so they
+    # do not overwrite the flat-RO results: mc_v2_<STATE>_RBAT_ROspiral_add_const_n1000.{csv,png}.
     run_monte_carlo_multistate(
-        states=("CO", "FL"),
-        treatment_train="CBAT",
-        mc_config=CBAT_MC_CONFIG,
+        states=("CA", "CO", "FL"),
+        treatment_train="RBAT",
         num_samples=1000,
         seed=0,
     )
-
-    # RBAT Monte Carlo for CA / CO / FL on the SAME 1000 random input samples (only the
-    # state's regulatory requirements -- and therefore LCOW -- differ): uncomment to run.
-    # run_monte_carlo_multistate(
-    #     states=("CA", "CO", "FL"),
-    #     treatment_train="RBAT",
-    #     num_samples=1000,
-    #     seed=0,
-    # )
-
-    # Single-state run (CA only): uncomment to run.
-    # run_monte_carlo(state="CA", treatment_train="RBAT", num_samples=1000, seed=0)
 
     # Default grid sweep (1-D feed-flow, matches DPR_sweep_v1 scope): uncomment to run.
     # run_sweep()

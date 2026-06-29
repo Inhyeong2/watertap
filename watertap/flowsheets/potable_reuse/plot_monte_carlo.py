@@ -28,12 +28,20 @@ DEFAULT_CSV = os.path.join(
 
 
 def plot_flow_vs_lcow(
-    csv_path=None, output_png=None, show=False, label=None, ylim=None
+    csv_path=None, output_png=None, show=False, label=None, ylim=None, xlim=None,
+    color_by="brine_disposal_cost", point_color="tab:blue",
+    curves=None,
 ):
-    """Scatter system capacity (MGD) vs LCOW from a Monte Carlo CSV, colored by brine
-    disposal cost. ``label`` (e.g. "CA / RBAT") is added to the title to distinguish
-    per-state plots. ``ylim`` (lo, hi) fixes the LCOW axis so several plots share the
-    same scale for direct comparison. Returns (output_png, n_total, n_failed)."""
+    """Scatter system capacity (MGD) vs LCOW from a Monte Carlo CSV. ``label`` (e.g.
+    "CA / RBAT") is added to the title to distinguish per-state plots. ``ylim`` (lo, hi)
+    fixes the LCOW axis so several plots share the same scale for direct comparison.
+
+    ``color_by`` names a CSV column used to color the points (with a colorbar). It
+    defaults to ``brine_disposal_cost`` (the RBAT third swept dimension). If that column
+    is absent -- e.g. a CBAT run, which has no brine handle -- the points are drawn in a
+    single color instead. Pass ``color_by=None`` to force a single-color scatter.
+
+    Returns (output_png, n_total, n_failed)."""
     if csv_path is None:
         csv_path = DEFAULT_CSV
     df = pd.read_csv(csv_path)
@@ -48,22 +56,45 @@ def plot_flow_vs_lcow(
     converged["flow_MGD"] = converged["feed_flow"] / MGD
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    sc = ax.scatter(
-        converged["flow_MGD"],
-        converged["LCOW"],
-        c=converged["brine_disposal_cost"],
-        cmap="viridis",
-        s=18,
-        alpha=0.75,
-        edgecolors="none",
-    )
-    cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label("Brine disposal cost ($/m$^3$)")
+    if color_by is not None and color_by in converged.columns:
+        sc = ax.scatter(
+            converged["flow_MGD"],
+            converged["LCOW"],
+            c=converged[color_by],
+            cmap="viridis",
+            s=18,
+            alpha=0.75,
+            edgecolors="none",
+        )
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(f"{color_by} ($/m$^3$)")
+    else:
+        # No color dimension (e.g. CBAT has no brine_disposal_cost) -> single color.
+        ax.scatter(
+            converged["flow_MGD"],
+            converged["LCOW"],
+            color=point_color,
+            s=18,
+            alpha=0.55,
+            edgecolors="none",
+            label="Monte Carlo samples",
+        )
+
+    # Optional overlay curves. ``curves`` is a list of dicts:
+    #   {"x":..., "y":..., "color":..., "label":..., "ls":"-"}
+    # e.g. worst-case (cost-max inputs) and best-case (cost-min inputs) optimal LCOW.
+    if curves:
+        for c in curves:
+            ax.plot(c["x"], c["y"], color=c.get("color", "black"), lw=2.2,
+                    ls=c.get("ls", "-"), marker="o", ms=3, label=c.get("label"), zorder=5)
+        ax.legend()
 
     ax.set_xlabel("System capacity (MGD)")
     ax.set_ylabel("LCOW ($/m$^3$)")
     if ylim is not None:
         ax.set_ylim(ylim)
+    if xlim is not None:
+        ax.set_xlim(xlim)
     title = "DPR Monte Carlo: LCOW vs system capacity"
     if label:
         title += f" [{label}]"
