@@ -63,11 +63,11 @@ class UVAOPDPRZOData(ZeroOrderBaseData):
             doc="Mass flow rate of H2O2",
         )
 
-        self.hypochlorite = Var(                    # Plumlee et al. for CBAT
+        self.hypochlorite = Var(   # AOP oxidant chlorine DOSED at this unit; = 1.65 * H2O2 (Plumlee et al.). COSTED.
             self.flowsheet().time,
             units=pyunits.kg / pyunits.s,
             bounds=(0, None),
-            doc="Mass flow rate of hypochlorite",
+            doc="Mass flow rate of hypochlorite (free chlorine dosed at the UV/AOP as AOP oxidant)",
         )
 
         self.lamp_replacement = Var(
@@ -92,11 +92,38 @@ class UVAOPDPRZOData(ZeroOrderBaseData):
             doc="Electricity consumption of unit",
         )
 
-        if self.config.treatment_train == "RBAT":
+        # --- Two DISTINCT chlorine inputs around RO / UV-AOP (do not conflate) ---------------------
+        # NaOCl ("sodium hypochlorite") is the single source chemical for both; `hypochlorite` and the
+        # hypochlorite ion of NaOCl are the same species. What differs is WHERE it is added, what it
+        # speciates into, and whether its chemical cost is counted here:
+        #
+        #  (1) Biofouling control AHEAD of RO  ->  represented below by `chloramine_dose`. NOT costed.
+        #      NaOCl is dosed upstream of the membranes and reacts with the ammonia in the secondary
+        #      effluent to form CHLORAMINE (combined chlorine). Chloramine is used (not free chlorine)
+        #      because free chlorine would oxidize the polyamide RO membrane. Monochloramine is poorly
+        #      rejected by RO (~9% removal; ~90% passes into the permeate), so ~2.5 mg/L survives to the
+        #      UV reactor. Here it is an INTERFERENT, not a reagent: it absorbs UV and scavenges OH
+        #      radicals, RAISING the UV dose needed for 0.5-log 1,4-dioxane removal (see the RBAT branch
+        #      of required_UV_dose_constraint, where uv_dose grows with nh2cl). Its chemical cost is
+        #      intentionally omitted -- at 2-3 mg/L it is ~0.1% of OPEX, negligible vs electricity and
+        #      membranes. So `chloramine_dose` is a fixed influent CONCENTRATION at the UV reactor, NOT
+        #      a dose applied by this unit.
+        #
+        #  (2) AOP oxidant AT the UV-AOP  ->  the `hypochlorite` Var above. COSTED.
+        #      Free chlorine (NaOCl) dosed at the UV reactor as the AOP oxidant alongside H2O2
+        #      (UV/chlorine + peroxide), sized as hypochlorite = 1.65 * H2O2 (Plumlee et al.) and
+        #      registered as a "hypochlorite" cost flow in cost_uv_aop().
+        #
+        # CBAT has no chloramine term: upstream GAC adsorbs the chloramine so essentially none reaches
+        # the UV reactor, and there the required UV dose is a function of H2O2 alone. IPR (UF->RO->UV/AOP)
+        # has no GAC either, and -- like RBAT -- chloramine dosed upstream of RO for biofouling control
+        # passes RO (~90%) and reaches the UV reactor, so IPR uses the same chloramine-aware UV-dose form.
+        if self.config.treatment_train in ("RBAT", "IPR"):
             self.chloramine_dose = Var(
                 self.flowsheet().time,
                 units=pyunits.mg / pyunits.L,
-                doc="Chloramine dose (mg/L as Cl2)",
+                doc="Residual chloramine CONCENTRATION at the UV reactor (carried through RO from "
+                    "upstream biofouling chloramination; UV interferent, not dosed/costed here) [mg/L as Cl2]",
             )
 
         @self.Constraint(self.flowsheet().time, doc="UV-AOP power constraint")
@@ -119,7 +146,9 @@ class UVAOPDPRZOData(ZeroOrderBaseData):
                         6560.7 * h2o2 +
                         19581
                 ) * (pyunits.mJ / pyunits.cm ** 2)
-            elif b.config.treatment_train == "RBAT":
+            elif b.config.treatment_train in ("RBAT", "IPR"):
+                # nh2cl = residual chloramine at the UV reactor (interferent; see note at chloramine_dose).
+                # uv_dose grows with nh2cl (UV absorption / radical scavenging) and falls with h2o2 (oxidant).
                 nh2cl = b.chloramine_dose[t] / (1 * pyunits.mg / pyunits.L)
                 return b.uv_dose[t] == (
                         2336.25 * nh2cl / h2o2 + 125

@@ -30,7 +30,7 @@ DEFAULT_CSV = os.path.join(
 def plot_flow_vs_lcow(
     csv_path=None, output_png=None, show=False, label=None, ylim=None, xlim=None,
     color_by="brine_disposal_cost", point_color="tab:blue",
-    curves=None,
+    curves=None, title_prefix="DPR",
 ):
     """Scatter system capacity (MGD) vs LCOW from a Monte Carlo CSV. ``label`` (e.g.
     "CA / RBAT") is added to the title to distinguish per-state plots. ``ylim`` (lo, hi)
@@ -95,7 +95,7 @@ def plot_flow_vs_lcow(
         ax.set_ylim(ylim)
     if xlim is not None:
         ax.set_xlim(xlim)
-    title = "DPR Monte Carlo: LCOW vs system capacity"
+    title = f"{title_prefix} Monte Carlo: LCOW vs system capacity"
     if label:
         title += f" [{label}]"
     ax.set_title(

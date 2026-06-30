@@ -1,0 +1,2520 @@
+"""
+Non-RO DPR (O3/BAF/UF/Carbon_Adsorption/UV_AOP/Chlorination) and RO DPR (Cl/UF/RO/UV_AOP)
+This module contains a zero-order representation of each unit except RO
+
+v2 changes (sweep-readiness):
+  1. ``get_sweep_handles`` -- a registry mapping stable names to the Pyomo objects
+     that are sensible sweep targets, so a multi-variable sweep can be declared by
+     name without reaching into model internals. Handles are grouped by how they
+     behave with respect to degrees of freedom (inputs / decisions / costing).
+  2. ``main(..., verbose=...)`` -- lets a sweep build the model quietly (no per-build
+     display output / solver logs).
+
+Note: per-sample rescaling was tried (refreshing scale_system at each sweep point)
+but removed -- the warm-started model plus the solver's own Jacobian autoscaling
+already converge wide sweeps (feed flow 1-100 MGD: 21/21, feed TDS 0.5-2.0: 16/16),
+and re-running scale_system mid-sweep perturbed the warm start and converged fewer
+points. The sweep therefore solves with the plain ``solve`` (v1 behavior).
+"""
+
+import os, math
+import idaes.logger as idaeslog
+import pyomo.environ as pyo
+from pyomo.environ import (
+    assert_optimal_termination,
+    check_optimal_termination,
+    ConcreteModel,
+    Constraint,
+    Block,
+    Expression,
+    Objective,
+    value,
+    Var,
+    Reference,
+    TransformationFactory,
+    units as pyunits,
+)
+from pyomo.network import Arc, SequentialDecomposition
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
+from pyomo.util.check_units import assert_units_consistent
+
+from idaes.core import (
+    FlowsheetBlock,
+    MomentumBalanceType,
+    UnitModelBlockData,
+)
+
+from watertap.core.solvers import get_solver
+from idaes.core.util.initialization import propagate_state
+
+import idaes.core.util.scaling as iscale
+from idaes.core.util.exceptions import ConfigurationError
+from idaes.models.unit_models import (
+    Feed,
+    Mixer,
+    Separator,
+    Product,
+    Translator,
+    MomentumMixingType,
+)
+
+from idaes.core import UnitModelCostingBlock
+
+from watertap.unit_models.pressure_exchanger import PressureExchanger
+from watertap.unit_models.pressure_changer import Pump, EnergyRecoveryDevice
+from watertap.core.util.initialization import assert_degrees_of_freedom
+
+from watertap.property_models.seawater_prop_pack import SeawaterParameterBlock
+from watertap.unit_models.reverse_osmosis_0D import (
+    ReverseOsmosis0D,
+    ConcentrationPolarizationType,
+    MassTransferCoefficient,
+    PressureChangeType,
+)
+from watertap.core.membrane_channel_base import ModuleType
+
+from watertap.core.zero_order_properties import WaterParameterBlock
+from watertap.core.wt_database import Database
+from watertap.unit_models.zero_order import (
+    FeedZO,
+    OzoneDPRZO,
+    BioActiveFiltrationDPRZO,
+    UltraFiltrationDPRZO,
+    GACDPRZO,
+    UVAOPDPRZO,
+    ChlorinationDPRZO,
+)
+
+from watertap.costing.zero_order_costing import ZeroOrderCosting
+from watertap.costing import WaterTAPCosting
+
+import pprint
+
+# Some more information about this module
+__author__ = "Inhyeong Jeon"
+
+# Set up logger
+_log = idaeslog.getLogger(__name__)
+
+# Directory holding this module (and the DPR database yaml files:
+# ozonation_DPR.yaml, nonRO_DPR_global_costing.yaml, ...).
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _resolve_db_path(working_directory):
+    """Resolve the zero-order Database path.
+
+    The DPR database yaml files live next to this module, so the default
+    ("module") makes ``main()`` / the build functions work regardless of the current
+    working directory (previously ``"local"`` = os.getcwd() forced callers to run
+    from the potable_reuse folder). Accepted values:
+      "module" : the directory containing this module (default).
+      "local"  : the current working directory (legacy behavior).
+      None     : the shared WaterTAP zero-order db (../data/techno_economic) -- note
+                 the DPR-specific yamls are NOT there.
+      <path>   : an explicit existing directory.
+    """
+    if working_directory == "module":
+        return _MODULE_DIR
+    if working_directory == "local":
+        return os.getcwd()
+    if working_directory is None:
+        return os.path.join(_MODULE_DIR, "..", "data", "techno_economic")
+    if isinstance(working_directory, str) and os.path.isdir(working_directory):
+        return working_directory
+    raise TypeError(
+        "working_directory should be 'module', 'local', None, or an existing "
+        f"directory path; got {working_directory!r}."
+    )
+
+def main(state="CA", treatment_train="RBAT", effluent_type="TERTIARY", verbose=True, n_stages=2):
+    # Define initial setting
+    LRV_req, details, state, treatment_train, effluent_type, solute_list = DPR_initial_setting(state=state, treatment_train=treatment_train, effluent_type=effluent_type)
+
+    # build, set, and initialize
+    if treatment_train == "CBAT":
+        m = build_nonRO(solute_list=solute_list,
+                        state=state,
+                        effluent_type=effluent_type,
+                        treatment_train=treatment_train,
+                        LRVO3_req=LRV_req["ozone_crypto_lrv_required"],
+                        LRVClvirus_req=LRV_req["cl2_virus_lrv_required"],
+                        LRVClgiardia_req=LRV_req["cl2_giardia_lrv_required"],)
+    elif treatment_train in ("RBAT", "IPR"):
+        build_kwargs = dict(solute_list=solute_list, state=state, effluent_type=effluent_type,
+                            treatment_train=treatment_train, n_stages=n_stages)
+        if treatment_train == "RBAT":
+            # IPR has no ozone or final chlorination, so it carries no ozone/Cl2 LRV requirements.
+            build_kwargs.update(LRVO3_req=LRV_req["ozone_crypto_lrv_required"],
+                                LRVClvirus_req=LRV_req["cl2_virus_lrv_required"],
+                                LRVClgiardia_req=LRV_req["cl2_giardia_lrv_required"])
+        m = build_RO(**build_kwargs)
+
+    set_operating_conditions(m, solute_list=solute_list, treatment_train=treatment_train)
+    scale_system(m, treatment_train=treatment_train)
+
+    initialize_system(m, treatment_train=treatment_train)
+    assert_degrees_of_freedom(m, 0)
+    results = solve(m, tee=verbose)
+    assert_optimal_termination(results)
+
+    add_costing(m, treatment_train=treatment_train)
+    initialize_costing(m, treatment_train=treatment_train)
+    assert_degrees_of_freedom(m, 0)  # ensures problem is square
+
+    optimize_operation(m, state=state, effluent_type=effluent_type, treatment_train=treatment_train)
+    results = solve(m, tee=verbose)
+    assert_optimal_termination(results)
+
+    if verbose:
+        display_initial_setting(LRV_req=LRV_req, process_details=details, solute_list=solute_list)
+        display_results(m, treatment_train=treatment_train)
+        display_cost(m, treatment_train=treatment_train)
+        display_cost_output(m, treatment_train=treatment_train)
+
+    return m, results
+
+def DPR_initial_setting(state=None, treatment_train=None, effluent_type=None):  #In the future, we might need to consider another type of tratment_train for Secondary effluent (for nutrient removal)
+    # Water quality
+    if effluent_type.upper() not in ["TERTIARY", "SECONDARY"]:
+        raise ValueError("Unsupported type of effluent. Choose 'TERTIARY' or 'SECONDARY'.")
+
+    solute_list = {
+        "TERTIARY": {
+            "toc": 0.01 * pyunits.kg / pyunits.m ** 3, # 1kg/m3 = 1000 mg/L
+            "tds": 0.5 * pyunits.kg / pyunits.m ** 3,
+            "nitrate": 0.01 * (62.0049/14.0067) * pyunits.kg / pyunits.m ** 3,
+            "nitrite": 0.01 * (46.0055/14.0067) * pyunits.kg / pyunits.m ** 3,
+        },
+        "SECONDARY": {
+            "toc": 0.01 * pyunits.kg / pyunits.m ** 3,
+            "tds": 1 * pyunits.kg / pyunits.m ** 3,
+            "nitrate": 0.01 * (62.0049 / 14.0067) * pyunits.kg / pyunits.m ** 3,
+            "nitrite": 0.01 * (46.0055 / 14.0067) * pyunits.kg / pyunits.m ** 3,
+        },
+    }
+    selected_solutes = solute_list[effluent_type]
+
+    # Regulatory requirements -- DPR (direct potable reuse: no environmental buffer, so the whole
+    # pathogen reduction must be achieved by engineered treatment). CA = the 2024 DPR rule 20/14/15.
+    state_requirements = {
+        "CA": {"virus": 20, "giardia": 14, "crypto": 15, "min_processes": 4},
+        "CO": {"virus": 12, "giardia": 10, "crypto": 10, "min_processes": 3},
+        "FL": {"virus": 14, "giardia": 12, "crypto": 12, "min_processes": 3},
+        "AZ": {"virus": 14, "giardia": 12, "crypto": 12, "min_processes": 3},
+    }
+
+    # Regulatory requirements -- IPR (indirect potable reuse via groundwater replenishment). CA follows
+    # the Title 22 "12/10/10 rule" with a minimum of 3 treatment barriers (each credited >=1-log, none
+    # credited >6-log). Unlike DPR, an environmental buffer (underground retention) is present and is a
+    # credited barrier -- it supplies the virus log shortfall (see the IPR block below). Only CA is
+    # supported for IPR here; other states' IPR rules have not been reviewed, so they are rejected
+    # rather than guessed.
+    ipr_state_requirements = {
+        "CA": {"virus": 12, "giardia": 10, "crypto": 10, "min_processes": 3},
+    }
+
+    if state.upper() not in ["CA", "CO", "FL", "AZ"]:
+        raise ValueError("Unsupported state. Choose 'CA', 'CO', 'FL' or 'AZ'.")
+
+    fixed_LRV = {
+        "BAC": {"virus": 0, "giardia": 0, "crypto": 0},
+        "UF": {"virus": 0, "giardia": 4, "crypto": 4},
+        "RO": {"virus": 2, "giardia": 2, "crypto": 2},
+        "GAC": {"virus": 0, "giardia": 0, "crypto": 0},
+        "UV-AOP": {"virus": 6, "giardia": 6, "crypto": 6},
+    }
+
+    if treatment_train.upper() == "RBAT":
+        train = ["Ozone", "BAC", "UF", "RO", "UV-AOP", "Cl2"]
+    elif treatment_train.upper() == "CBAT":
+        train = ["Ozone", "BAC", "UF", "GAC", "UV-AOP", "Cl2"]
+    elif treatment_train.upper() == "IPR":
+        # Indirect potable reuse full-advanced-treatment train (OCWD GWRS style): no ozone/BAC/GAC,
+        # no final chlorination. The virus shortfall is met by the environmental buffer (underground
+        # retention), handled in the dedicated IPR block below.
+        train = ["UF", "RO", "UV-AOP"]
+    else:
+        raise ValueError("Unsupported treatment train. Choose 'RBAT', 'CBAT', or 'IPR'.")
+
+    # --- IPR pathogen accounting (separate from the DPR ozone/Cl2 fill logic below) -------------
+    # The engineered train (UF/RO/UV-AOP) provides fixed credits; the remaining virus log reduction
+    # is supplied by underground retention, which CA credits at ~1-log virus per month of demonstrated
+    # subsurface travel time (capped at the 6-log single-barrier maximum). Retention also serves as the
+    # 3rd treatment barrier for virus (UF contributes 0-log virus, so the engineered train alone gives
+    # only RO + UV/AOP = 2 virus barriers). Giardia/Crypto are already met by UF+RO+UV/AOP (12-log each).
+    if treatment_train.upper() == "IPR":
+        if state.upper() not in ipr_state_requirements:
+            raise ValueError(
+                f"IPR is only supported for CA (Title 22 groundwater replenishment); "
+                f"'{state}' IPR requirements have not been reviewed.")
+        reg = ipr_state_requirements[state.upper()]
+        LRV_req = {}
+        process_details = {}
+        for pathogen in ["virus", "giardia", "crypto"]:
+            total_fixed = 0
+            used_processes = 0
+            contributing_units = []
+            for proc in train:  # ["UF", "RO", "UV-AOP"]
+                val = fixed_LRV.get(proc, {}).get(pathogen, 0)
+                total_fixed += val
+                if val >= 1:
+                    used_processes += 1
+                    contributing_units.append(f"{proc} LRV {val}")
+
+            remaining_lrv = reg[pathogen] - total_fixed
+            if pathogen == "virus":
+                retention_lrv = min(max(0, remaining_lrv), 6)  # 6-log single-barrier cap
+                LRV_req["retention_virus_lrv_required"] = round(retention_lrv)
+                # ~1-log virus per month of underground travel time (tracer-demonstrated; see the
+                # note in build_RO). This is the design retention requirement, not a costed unit.
+                LRV_req["retention_months_required"] = round(retention_lrv)
+                total = total_fixed + retention_lrv
+                process_ct = used_processes + (1 if retention_lrv >= 1 else 0)
+                if retention_lrv >= 1:
+                    contributing_units.append(
+                        f"Underground retention LRV {round(retention_lrv)} (~{round(retention_lrv)} months)")
+            else:
+                total = total_fixed
+                process_ct = used_processes
+
+            status = "OK"
+            if total < reg[pathogen] and process_ct < reg["min_processes"]:
+                status = (f"Fails: only {round(total)} LRV (needs {reg[pathogen]}) and only "
+                          f"{process_ct} processes (needs {reg['min_processes']})")
+            elif total < reg[pathogen]:
+                status = f"Fails: only {round(total)} LRV, needs {reg[pathogen]}"
+            elif process_ct < reg["min_processes"]:
+                status = f"Fails: only {process_ct} processes, needs {reg['min_processes']}"
+            if "Fails" in status:
+                raise ValueError(f"  [IPR/{state}] {pathogen}: {status}")
+
+            process_details[pathogen] = {
+                "Processes Used": contributing_units,
+                "Number of Processes": process_ct,
+                "Required LRV": reg[pathogen],
+                "Min Required Processes": reg["min_processes"],
+                "Sum of LRV": round(total),
+                "Regulatory Status": status,
+            }
+        return LRV_req, process_details, state, treatment_train, effluent_type, selected_solutes
+
+    reg = state_requirements[state.upper()]
+    LRV_req = {}
+    process_details = {}
+
+    for pathogen in ["virus", "giardia", "crypto"]:
+        total_fixed = 0
+        used_processes = 0
+        contributing_units = []
+
+        for proc in train:
+            if proc == "Ozone":
+                val = 6 if pathogen != "crypto" else 0
+            elif proc == "Cl2":
+                val = 0
+            else:
+                val = fixed_LRV.get(proc, {}).get(pathogen, 0)
+
+            total_fixed += val
+            if val >= 1:
+                used_processes += 1
+                contributing_units.append(f"{proc} LRV {val}")
+
+        required_total = reg[pathogen]
+        remaining_lrv = required_total - total_fixed
+        status = "OK"
+
+        if pathogen == "crypto":
+            ozone_crypto = 1 if remaining_lrv <= 0 else min(remaining_lrv, 6)
+            LRV_req["ozone_crypto_lrv_required"] = round(ozone_crypto)
+            total = total_fixed + ozone_crypto
+            process_ct = used_processes + 1
+            contributing_units.append(f"Ozone LRV {round(ozone_crypto)}")
+
+        else:
+            cl2_lrv = 0 if remaining_lrv <= 0 else min(remaining_lrv, 6)
+            if cl2_lrv == 0 and used_processes < reg["min_processes"]:
+                cl2_lrv = 1
+            LRV_req[f"cl2_{pathogen}_lrv_required"] = round(cl2_lrv)
+            total = total_fixed + cl2_lrv
+            process_ct = used_processes + (1 if cl2_lrv >= 1 else 0)
+            if cl2_lrv >= 1:
+                contributing_units.append(f"Cl2 LRV {round(cl2_lrv)}")
+
+        if total < required_total and process_ct < reg["min_processes"]:
+            status = (f"Fails: only {round(total)} LRV, needs {required_total}. only {process_ct} processes, needs {reg['min_processes']}")
+        elif total < required_total and process_ct >= reg["min_processes"]:
+            status = (f"Fails: only {round(total)} LRV, needs {required_total}")
+        elif process_ct < reg["min_processes"]:
+            status = f"Fails: only {process_ct} processes, needs {reg['min_processes']}"
+
+        if "Fails" in status:
+            raise ValueError(f"  {status}")
+
+        process_details[pathogen] = {
+            "Processes Used": contributing_units,
+            "Number of Processes": process_ct,
+            "Required LRV": required_total,
+            "Min Required Processes": reg["min_processes"],
+            "Sum of LRV": round(total),
+            "Regulatory Status": status
+        }
+
+    if LRV_req["cl2_giardia_lrv_required"] >= 1 and LRV_req["cl2_virus_lrv_required"] == 0:
+        LRV_req["cl2_virus_lrv_required"] = 6
+        process_details["virus"]["Processes Used"].append("Cl2 LRV 6")
+        process_details["virus"]["Number of Processes"] += 1
+        process_details["virus"]["Sum of LRV"] += 6
+
+    elif LRV_req["cl2_giardia_lrv_required"] >= 1 and LRV_req["cl2_virus_lrv_required"] > 0:
+        LRV_req0 = LRV_req["cl2_virus_lrv_required"]
+        LRV_req["cl2_virus_lrv_required"] = 6
+
+        # NEW LRV update
+        process_details["virus"]["Processes Used"] = [
+            entry for entry in process_details["virus"]["Processes Used"]
+            if not entry.startswith("Cl2 LRV")
+        ]
+        process_details["virus"]["Processes Used"].append("Cl2 LRV 6")
+        process_details["virus"]["Sum of LRV"] += 6 - LRV_req0
+
+   # CTCl_giardia = 15.257 * LRV_req["cl2_giardia_lrv_required"] + 0.1333
+   # CTCl_virus = 0.5 * LRV_req["cl2_virus_lrv_required"]
+
+    return LRV_req, process_details, state, treatment_train, effluent_type, selected_solutes
+
+def display_initial_setting(LRV_req=None, process_details=None, solute_list=None):
+    print("\n--- Required LRV Results ---")
+    pprint.pprint(LRV_req)
+    print("\n--- Process Summary by Pathogen ---")
+    for k, v in process_details.items():
+        print(f"\n{k.upper()}:")
+        for key, val in v.items():
+            print(f"  {key}: {val}")
+    print("\n--- Solute List (Water Quality) ---")
+    pprint.pprint(solute_list)
+
+def build_nonRO(working_directory="module", state=None, solute_list=None, effluent_type=None, treatment_train=None,LRVO3_req=None, LRVClvirus_req=None, LRVClgiardia_req=None):
+    m = ConcreteModel()
+    m.db = Database(dbpath=_resolve_db_path(working_directory))
+    m.fs = FlowsheetBlock(dynamic=False)
+    m.fs.prop_zo = WaterParameterBlock(solute_list=solute_list)
+
+    # define blocks
+    non_RO = m.fs.non_RO = Block()
+
+    # define flowsheet inlets and outlets
+    m.fs.feed = FeedZO(property_package=m.fs.prop_zo)
+    non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
+                              LRVO3_required=LRVO3_req)
+    non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
+    non_RO.UF = UltraFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db)
+    non_RO.GAC = GACDPRZO(property_package=m.fs.prop_zo, database=m.db)
+    non_RO.UV_AOP = UVAOPDPRZO(property_package=m.fs.prop_zo, database=m.db, treatment_train=treatment_train)
+    non_RO.Cl = ChlorinationDPRZO(property_package=m.fs.prop_zo, database=m.db, LRVCl_required_for_virus=LRVClvirus_req, LRVCl_required_for_giardia=LRVClgiardia_req)
+
+    m.fs.byproduct_BAF = Product(property_package=m.fs.prop_zo)
+    m.fs.byproduct_UF = Product(property_package=m.fs.prop_zo)
+    m.fs.byproduct_GAC = Product(property_package=m.fs.prop_zo)
+    m.fs.treated_nonRO = Product(property_package=m.fs.prop_zo)
+
+    # connections (non-RO DPR)
+    m.fs.s_non_RO_feed = Arc(source=m.fs.feed.outlet, destination=non_RO.Ozone.inlet)
+    non_RO.s01 = Arc(source=non_RO.Ozone.treated, destination=non_RO.BAF.inlet)
+    non_RO.s02 = Arc(source=non_RO.BAF.treated, destination=non_RO.UF.inlet)
+    non_RO.s03 = Arc(source=non_RO.UF.treated, destination=non_RO.GAC.inlet)
+    non_RO.s04 = Arc(source=non_RO.GAC.treated, destination=non_RO.UV_AOP.inlet)
+    non_RO.s05 = Arc(source=non_RO.UV_AOP.treated, destination=non_RO.Cl.inlet)
+    non_RO.s06 = Arc(source=non_RO.Cl.treated, destination=m.fs.treated_nonRO.inlet)
+
+    m.fs.s01 = Arc(source=non_RO.BAF.byproduct, destination=m.fs.byproduct_BAF.inlet)
+    m.fs.s02 = Arc(source=non_RO.UF.byproduct, destination=m.fs.byproduct_UF.inlet)
+    m.fs.s03 = Arc(source=non_RO.GAC.byproduct, destination=m.fs.byproduct_GAC.inlet)
+
+    TransformationFactory("network.expand_arcs").apply_to(m)
+    return m
+
+def build_RO(working_directory="module", state=None, solute_list=None, effluent_type=None, treatment_train=None, LRVO3_req=None, LRVClvirus_req=None, LRVClgiardia_req=None, n_stages=2):
+    m = ConcreteModel()
+    m.db = Database(dbpath=_resolve_db_path(working_directory))
+    m.fs = FlowsheetBlock(dynamic=False)
+    m.fs.prop_zo = WaterParameterBlock(solute_list=solute_list)
+    m.fs.prop_ro = SeawaterParameterBlock()
+
+    # define blocks
+    non_RO = m.fs.non_RO = Block()
+    RO_main = m.fs.RO_main = Block()
+    # RO_post = m.fs.RO_post = Block()
+
+    # Number of RO stages (single feed pump + retentate cascade + shared permeate mixer).
+    # n_stages=1 reproduces the original single-stage spiral RO DPR; n_stages>=2 stages the
+    # RO array so each stage's concentrate (retentate) feeds the next stage's inlet, while
+    # every stage's permeate is collected in a shared permeate mixer. Stored on RO_main so the
+    # set/scale/initialize/cost/display helpers can recover the stage count from the model.
+    RO_main.n_stages = int(n_stages)
+    RO_main.stages = pyo.Set(initialize=list(range(1, RO_main.n_stages + 1)), doc="RO stages")
+
+    # define flowsheet inlets and outlets
+    m.fs.feed = FeedZO(property_package=m.fs.prop_zo)
+    m.fs.treated_RO = Product(property_package=m.fs.prop_zo)
+
+    # RO DPR / IPR components. IPR (UF -> RO -> UV/AOP, OCWD GWRS style) omits ozone/BAC and final
+    # chlorination, so those units -- and the BAC backwash byproduct -- are built only for the DPR
+    # trains. UF and its backwash byproduct are common to all RO trains.
+    #
+    # NOTE on the IPR environmental buffer (underground retention). IPR discharges the UV/AOP product
+    # to a groundwater aquifer (recharge/injection) rather than directly to the potable system. That
+    # subsurface travel before extraction is the "environmental buffer" that distinguishes indirect
+    # from direct potable reuse, and CA credits it for pathogen control. It is intentionally NOT a
+    # unit on this flowsheet: it has no treatment-plant CAPEX/OPEX (it is the aquifer), so modeling it
+    # would not change LCOW. Its ROLE is captured upstream in DPR_initial_setting: the engineered
+    # train (UF+RO+UV/AOP) provides 8-log virus (RO 2 + UV/AOP 6; UF gives 0-log virus), and the
+    # buffer supplies the remaining virus log reduction at CA's credit of ~1-log virus per month of
+    # demonstrated subsurface retention -- i.e. ~4 months for the 4-log shortfall to reach 12-log, and
+    # it also serves as virus's 3rd treatment barrier (the engineered train alone gives only 2 for
+    # virus). The required retention is reported as retention_months_required. Caveats: (1) the credit
+    # must be demonstrated by a tracer study and is capped at the 6-log single-barrier maximum;
+    # (2) the "~1-log/month" basis follows OCWD GWRS practice and CA guidance -- it was not confirmed
+    # against the verbatim Title 22 section 60320.208 text here, so treat retention_months_required as
+    # a design assumption to be verified against the current regulation before citing it.
+    is_ipr = (treatment_train == "IPR")
+    if not is_ipr:
+        non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
+                                  LRVO3_required=LRVO3_req)
+        non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
+        m.fs.byproduct_BAF = Product(property_package=m.fs.prop_zo)
+    non_RO.UF = UltraFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db)
+    m.fs.byproduct_UF = Product(property_package=m.fs.prop_zo)
+
+    RO_main.pump = Pump(property_package=m.fs.prop_ro)
+    # Indexed RO array (one ReverseOsmosis0D per stage), all spiral-wound. Stage i's
+    # retentate feeds stage i+1; each stage's permeate goes to the shared permeate mixer.
+    RO_main.RO = ReverseOsmosis0D(
+                 RO_main.stages,
+                 property_package=m.fs.prop_ro,
+                 has_pressure_change=True,
+                 pressure_change_type=PressureChangeType.calculated,
+                 mass_transfer_coefficient=MassTransferCoefficient.calculated,
+                 concentration_polarization_type=ConcentrationPolarizationType.calculated,
+                 module_type=ModuleType.spiral_wound,
+                 has_full_reporting=True
+            )
+    # Permeate mixer: collects the permeate from every stage into a single product stream.
+    RO_main.P_mixer = Mixer(
+        property_package=m.fs.prop_ro,
+        inlet_list=[f"stage_{i}" for i in RO_main.stages],
+        momentum_mixing_type=MomentumMixingType.minimize,
+    )
+    RO_main.ERD = EnergyRecoveryDevice(property_package=m.fs.prop_ro)
+    m.fs.brine = Product(property_package=m.fs.prop_ro)
+
+    non_RO.UV_AOP = UVAOPDPRZO(property_package=m.fs.prop_zo, database=m.db, treatment_train=treatment_train)
+    if not is_ipr:
+        non_RO.Cl = ChlorinationDPRZO(property_package=m.fs.prop_zo, database=m.db, LRVCl_required_for_virus=LRVClvirus_req, LRVCl_required_for_giardia=LRVClgiardia_req)
+
+    # translator blocks
+    m.fs.tb_pre_main = Translator(
+        inlet_property_package=m.fs.prop_zo, outlet_property_package=m.fs.prop_ro
+    )
+
+    @m.fs.tb_pre_main.Constraint(["H2O", "tds"])
+    def eq_flow_mass_comp(blk, j):
+        if j == "tds":
+            return (
+                    blk.properties_in[0].flow_mass_comp["tds"]
+                    == blk.properties_out[0].flow_mass_phase_comp["Liq", "TDS"]
+            )
+        else:
+            return (
+                    blk.properties_in[0].flow_mass_comp["H2O"]
+                    == blk.properties_out[0].flow_mass_phase_comp["Liq", "H2O"]
+            )
+
+    m.fs.tb_main_post = Translator(
+        inlet_property_package=m.fs.prop_ro, outlet_property_package=m.fs.prop_zo
+    )
+
+    # System-level volumetric recovery across the whole RO array: total mixed permeate
+    # volume (P_mixer outlet) divided by the volume fed to the first stage (tb_pre_main
+    # outlet = RO feed). For n_stages=1 this equals the single stage's recovery_vol_phase;
+    # for multi-stage it is the cascade recovery, which is what the post-RO translator must
+    # use to carry the (incompletely rejected) solutes through to UV-AOP/Cl.
+    RO_main.sys_recovery_vol = Expression(
+        expr=RO_main.P_mixer.mixed_state[0].flow_vol_phase["Liq"]
+        / m.fs.tb_pre_main.properties_out[0].flow_vol_phase["Liq"]
+    )
+
+    # TODO: Should define specific solutes that cannot be perfectly removed by RO
+    specific_solutes = {"toc": 0.99, "nitrate": 0.90, "nitrite": 0.90} # solutes & rejection ratio (= 1-C_permeate/C_feed)
+
+    @m.fs.tb_main_post.Constraint(solute_list)
+    def eq_flow_mass_comp_main_post(blk, j):
+        if j == "tds":
+            return (
+                    blk.properties_in[0].flow_mass_phase_comp["Liq", "TDS"]
+                    == blk.properties_out[0].flow_mass_comp["tds"]
+            )
+        elif j == "H2O":
+            return (
+                    blk.properties_in[0].flow_mass_phase_comp["Liq", "H2O"]
+                    == blk.properties_out[0].flow_mass_comp["H2O"]
+            )
+        elif j in specific_solutes:
+            return blk.properties_out[0].flow_mass_comp[j] == (1 - specific_solutes[j]) * RO_main.sys_recovery_vol * m.fs.tb_pre_main.properties_in[0].flow_mass_comp[j]
+        else:
+            return blk.properties_out[0].flow_mass_comp[j] == RO_main.sys_recovery_vol * m.fs.tb_pre_main.properties_in[0].flow_mass_comp[j]
+
+    @m.fs.tb_main_post.Constraint()
+    def eq_flow_vol_main_post(blk):
+        return blk.properties_out[0].flow_vol == RO_main.P_mixer.mixed_state[0].flow_vol_phase["Liq"]
+
+    # connections (RO DPR / IPR). IPR routes the feed straight into UF (no ozone/BAC ahead of it);
+    # the DPR trains run feed -> Ozone -> BAF -> UF.
+    if is_ipr:
+        m.fs.s_RO_feed = Arc(source=m.fs.feed.outlet, destination=non_RO.UF.inlet)
+    else:
+        m.fs.s_RO_feed = Arc(source=m.fs.feed.outlet, destination=non_RO.Ozone.inlet)
+        non_RO.s01 = Arc(source=non_RO.Ozone.treated, destination=non_RO.BAF.inlet)
+        non_RO.s02 = Arc(source=non_RO.BAF.treated, destination=non_RO.UF.inlet)
+        m.fs.s_BAFby = Arc(source=non_RO.BAF.byproduct, destination=m.fs.byproduct_BAF.inlet)
+    m.fs.s_UF_tb1 = Arc(source=non_RO.UF.treated, destination=m.fs.tb_pre_main.inlet)
+    m.fs.s_UFby = Arc(source=non_RO.UF.byproduct, destination=m.fs.byproduct_UF.inlet)
+
+    m.fs.s_tb1_RO = Arc(source=m.fs.tb_pre_main.outlet, destination=RO_main.pump.inlet)
+
+    # RO array cascade: pump -> stage 1; stage (i-1) retentate -> stage i inlet; each
+    # stage permeate -> permeate mixer inlet stage_i.
+    for i in RO_main.stages:
+        if i == 1:
+            setattr(RO_main, f"s_ro_in_{i}",
+                    Arc(source=RO_main.pump.outlet, destination=RO_main.RO[i].inlet))
+        else:
+            setattr(RO_main, f"s_ro_in_{i}",
+                    Arc(source=RO_main.RO[i - 1].retentate, destination=RO_main.RO[i].inlet))
+        setattr(RO_main, f"s_ro_perm_{i}",
+                Arc(source=RO_main.RO[i].permeate,
+                    destination=getattr(RO_main.P_mixer, f"stage_{i}")))
+
+    # Last stage's retentate is the brine -> ERD -> disposal.
+    last_stage = RO_main.n_stages
+    RO_main.s03 = Arc(source=RO_main.RO[last_stage].retentate, destination=RO_main.ERD.inlet)
+    m.fs.s_disposal  = Arc(source=RO_main.ERD.outlet, destination=m.fs.brine.inlet)
+
+    # Mixed permeate -> post-RO translator.
+    m.fs.s_RO_tb2 = Arc(source=RO_main.P_mixer.outlet, destination=m.fs.tb_main_post.inlet)
+
+    # m.fs.s_tb2_prod = Arc(source=m.fs.tb_main_post.outlet, destination=m.fs.treated_RO.inlet)
+
+    m.fs.s_tb2_UVAOP = Arc(source=m.fs.tb_main_post.outlet, destination=non_RO.UV_AOP.inlet)
+    if is_ipr:
+        # IPR has no final chlorination: the UV/AOP product is the treated water sent to recharge.
+        m.fs.s_UVAOP_prod = Arc(source=non_RO.UV_AOP.treated, destination=m.fs.treated_RO.inlet)
+    else:
+        m.fs.s_UVAOP_Cl = Arc(source=non_RO.UV_AOP.treated, destination=non_RO.Cl.inlet)
+        m.fs.s_Cl_prod = Arc(source=non_RO.Cl.treated, destination=m.fs.treated_RO.inlet)
+
+    # RO arcs expansion
+    TransformationFactory("network.expand_arcs").apply_to(m)
+
+    return m
+
+def set_operating_conditions(m, solute_list=None, treatment_train=None):
+    # feed
+    feed_temperature = (273.15 + 25) * pyunits.K
+    feed_pressure = 101325 * pyunits.Pa
+    m.fs.feed.flow_vol[0].fix(10*0.0438126)
+
+    # fix solute concentrations
+    for solute, value_with_unit in solute_list.items():
+        m.fs.feed.conc_mass_comp[0, solute].fix(value_with_unit)
+    solve(m.fs.feed)
+
+    if treatment_train == "CBAT":  # non-RO DPR
+        non_RO = m.fs.non_RO
+
+        # Unit processes in non-RO DPR
+        non_RO.Ozone.load_parameters_from_database(use_default_removal=True)
+        non_RO.Ozone.contact_time[0].fix(5)
+
+        non_RO.BAF.load_parameters_from_database(use_default_removal=True)
+        non_RO.BAF.EBCT[0].fix(20)
+
+        non_RO.UF.load_parameters_from_database(use_default_removal=True)
+
+        non_RO.GAC.load_parameters_from_database(use_default_removal=True)
+        non_RO.GAC.EBCT[0].fix(15)
+        non_RO.GAC.required_BV[0].fix(20000)
+
+        non_RO.UV_AOP.load_parameters_from_database(use_default_removal=True)
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].fix(5)
+
+        non_RO.Cl.load_parameters_from_database(use_default_removal=True)
+        non_RO.Cl.contact_time[0].fix(30)
+
+        # iscale.set_variable_scaling_from_current_value(non_RO, descend_into=False)
+
+    elif treatment_train in ("RBAT", "IPR"):  # RO DPR / IPR
+        non_RO = m.fs.non_RO
+        RO_main = m.fs.RO_main
+        # RO_post = m.fs.RO_post
+
+        if treatment_train != "IPR":  # IPR has no ozone/BAC ahead of UF
+            non_RO.Ozone.load_parameters_from_database(use_default_removal=True)
+            non_RO.Ozone.contact_time[0].fix(5)
+
+            non_RO.BAF.load_parameters_from_database(use_default_removal=True)
+            non_RO.BAF.EBCT[0].fix(20)
+
+        non_RO.UF.load_parameters_from_database(use_default_removal=True)
+
+        # First translator block
+        m.fs.tb_pre_main.properties_out[0].temperature.fix(feed_temperature)
+        m.fs.tb_pre_main.properties_out[0].pressure.fix(feed_pressure)
+        m.fs.tb_pre_main.properties_out[0].pressure_osm_phase[...] #touching
+
+        # Pump
+        RO_main.pump.efficiency_pump.fix(0.80)
+        # Pump-pressure INITIAL GUESS, auto-scaled to feed salinity.
+        # Spiral-wound packs 2x membrane area per unit width vs flat-sheet (area = L*2*W),
+        # so the same recovery needs ~half the pressure. 20 atm gives a good starting recovery
+        # (~0.56 at TDS 0.5-1 kg/m3) and initializes cleanly; a fixed-high guess (e.g. 40 atm)
+        # over-drives recovery past ~0.9 at low TDS and the RO fails to initialize.
+        # BUT for a concentrated feed the back stage of the cascade sees a high osmotic
+        # pressure; a fixed 20 atm leaves it with NEGATIVE net driving pressure and the RO
+        # fails to initialize (empirically the back stage dies above ~TDS 15 kg/m3). So scale
+        # the guess with the feed osmotic pressure: pi ~ 0.85 atm per kg/m3 of TDS (van't Hoff,
+        # NaCl-equivalent); allow ~2.5x for cascade concentration of the back stage plus a
+        # ~10 atm net-driving margin. Floored at 20 atm (so low-TDS behavior -- and the
+        # TDS<=~4.7 results -- are byte-identical to before) and capped at 80 atm (just under
+        # the 83 bar optimization upper bound). The guess only seeds initialization; the
+        # optimizer unfixes the pressure afterwards, so the final result is unaffected.
+        feed_tds = value(m.fs.feed.conc_mass_comp[0, "tds"])  # kg/m3
+        osmotic_feed_atm = 0.85 * feed_tds                    # ~atm
+        pump_guess_atm = min(80.0, max(20.0, osmotic_feed_atm * 2.5 + 10.0))
+        RO_main.pump.outlet.pressure[0].fix(pump_guess_atm * 101325)
+
+        # RO unit -- identical membrane/geometry setup applied to every stage. The width
+        # guess decreases stage-to-stage because the retentate cascade roughly halves the
+        # feed flow each stage (assuming ~0.5 recovery per stage); width is then unfixed so
+        # the optimizer/solver picks the actual value (the guess only seeds the scaling).
+        for i in RO_main.stages:
+            stage = RO_main.RO[i]
+            stage.A_comp.fix(4.2e-12)  # membrane water permeability
+            stage.B_comp.fix(3.5e-8)  # membrane salt permeability
+            stage.feed_side.channel_height.fix(1e-3)  # channel height in membrane stage [m]
+            stage.length.fix(8)  # membrane length [m]
+            stage.feed_side.spacer_porosity.fix(0.85)  # spacer porosity in membrane stage [-]
+            stage.permeate.pressure[0].fix(101325)  # atmospheric pressure [Pa]
+            stage.feed_side.velocity[0, 0].fix(0.25)
+
+            stage_feed_guess = m.fs.feed.flow_vol[0].value * (0.5 ** (i - 1))
+            feed_side_area_guess = stage_feed_guess / stage.feed_side.velocity[0, 0].value
+            width_guess = feed_side_area_guess / stage.feed_side.spacer_porosity.value / stage.feed_side.channel_height.value
+
+            stage.feed_side.area.setub(None)
+            stage.width.setub(None)
+            stage.area.setub(None)
+            stage.width.fix(width_guess)
+            stage.width.unfix()  # Unfixed variables are width and recovery
+            stage.recovery_vol_phase[0, "Liq"].fix(0.5)
+            stage.recovery_vol_phase[0, "Liq"].unfix()
+        # ERD unit
+        RO_main.ERD.efficiency_pump.fix(0.8)
+        RO_main.ERD.control_volume.properties_out[0].pressure.fix(101325)  # Fix ERD outlet pressure to 1 atm
+
+        # Second translator block: no actions needed
+
+        non_RO.UV_AOP.load_parameters_from_database(use_default_removal=True)
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].fix(5)
+        # 2.5 mg/L = residual chloramine reaching the UV reactor (carried through RO from upstream
+        # biofouling chloramination), NOT a dose applied here. It is a UV interferent only; its chemical
+        # cost is not counted. See the detailed note at chloramine_dose in uv_aop_DPR_zo.py.
+        non_RO.UV_AOP.chloramine_dose[0].fix(2.5)
+
+        if treatment_train != "IPR":  # IPR has no final chlorination barrier
+            non_RO.Cl.load_parameters_from_database(use_default_removal=True)
+            non_RO.Cl.contact_time[0].fix(30)
+
+    return
+
+def scale_system(m, treatment_train = None):
+    # initialize feed
+    for j in m.fs.feed.properties[0].conc_mass_comp:
+        val = value(m.fs.feed.properties[0].conc_mass_comp[j])
+        m.fs.prop_zo.set_default_scaling("conc_mass_comp", 1 / val, index=j)
+    for j in m.fs.feed.properties[0].flow_mass_comp:
+        val = value(m.fs.feed.properties[0].flow_mass_comp[j])
+        m.fs.prop_zo.set_default_scaling("flow_mass_comp", 1 / val, index=j)
+
+    if treatment_train == "CBAT":
+        non_RO = m.fs.non_RO
+        for prop_blk in [non_RO.Ozone.properties_in[0], non_RO.Ozone.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(m.fs.feed.properties[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.Ozone.contact_time[0], 0.1)
+        iscale.set_scaling_factor(non_RO.Ozone.mass_transfer_efficiency[0], 1)
+        iscale.set_scaling_factor(non_RO.Ozone.specific_energy_coeff[0], 1/5)
+        iscale.set_scaling_factor(non_RO.Ozone.O3toTOC[0], 1)
+
+        for prop_blk in [non_RO.BAF.properties_in[0], non_RO.BAF.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(non_RO.Ozone.properties_treated[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.BAF.EBCT[0], 1/20)
+        iscale.set_scaling_factor(non_RO.BAF.energy_electric_flow_vol_inlet, 4)
+        iscale.set_scaling_factor(non_RO.BAF.removal_frac_mass_comp[0, "toc"], 3)
+
+        for prop_blk in [non_RO.UF.properties_in[0], non_RO.UF.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(non_RO.BAF.properties_treated[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.UF.energy_electric_flow_vol_inlet, 1)
+        iscale.set_scaling_factor(non_RO.UF.energy_membrane_replacement_flow_vol_inlet, 3)
+
+        for prop_blk in [non_RO.GAC.properties_in[0], non_RO.GAC.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(non_RO.UF.properties_treated[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.GAC.properties_in[0].conc_mass_comp["toc"], 0.1)
+        iscale.set_scaling_factor(non_RO.GAC.EBCT[0], 1/15)
+        iscale.set_scaling_factor(non_RO.GAC.energy_electric_flow_vol_inlet, 4)
+        iscale.set_scaling_factor(non_RO.GAC.required_BV[0], 5e-5)
+        iscale.set_scaling_factor(non_RO.GAC.removal_frac_mass_comp[0, "toc"], 2)
+
+        for prop_blk in [non_RO.UV_AOP.properties_in[0], non_RO.UV_AOP.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(non_RO.GAC.properties_treated[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.UV_AOP.uv_dose[0], 2e-3)
+        iscale.set_scaling_factor(non_RO.UV_AOP.hydrogen_peroxide_dose[0], 1/5)
+        iscale.set_scaling_factor(non_RO.UV_AOP.energy_electric_flow_vol_inlet, 10)
+
+        for prop_blk in [non_RO.Cl.properties_in[0], non_RO.Cl.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(non_RO.UV_AOP.properties_treated[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.Cl.energy_electric_flow_vol_inlet, 2e4) #todo: check this value
+        # iscale.set_scaling_factor(non_RO.Cl.initial_chlorine_demand[0], 1)
+        iscale.set_scaling_factor(non_RO.Cl.contact_time[0], 1/30)
+        iscale.set_scaling_factor(non_RO.Cl.chlorine_decay_rate[0], 10)
+        iscale.set_scaling_factor(non_RO.Cl.chlorine_dose[0], 1)
+
+    elif treatment_train in ("RBAT", "IPR"):
+        non_RO = m.fs.non_RO
+        RO_main = m.fs.RO_main
+
+        if treatment_train != "IPR":  # IPR has no ozone/BAC ahead of UF
+            for prop_blk in [non_RO.Ozone.properties_in[0], non_RO.Ozone.properties_treated[0]]:
+                for j in prop_blk.flow_mass_comp:
+                    val = value(m.fs.feed.properties[0].flow_mass_comp[j])
+                    iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+            iscale.set_scaling_factor(non_RO.Ozone.contact_time[0], 0.1)
+            iscale.set_scaling_factor(non_RO.Ozone.mass_transfer_efficiency[0], 1)
+            iscale.set_scaling_factor(non_RO.Ozone.specific_energy_coeff[0], 1 / 5)
+            iscale.set_scaling_factor(non_RO.Ozone.O3toTOC[0], 1)
+
+            for prop_blk in [non_RO.BAF.properties_in[0], non_RO.BAF.properties_treated[0]]:
+                for j in prop_blk.flow_mass_comp:
+                    val = value(non_RO.Ozone.properties_treated[0].flow_mass_comp[j])
+                    iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+            iscale.set_scaling_factor(non_RO.BAF.EBCT[0], 1 / 20)
+            iscale.set_scaling_factor(non_RO.BAF.energy_electric_flow_vol_inlet, 4)
+            iscale.set_scaling_factor(non_RO.BAF.removal_frac_mass_comp[0, "toc"], 3)
+
+        # UF feed magnitude: for IPR the raw feed enters UF directly; for DPR it is the BAF outlet.
+        uf_inlet_src = (m.fs.feed.properties[0] if treatment_train == "IPR"
+                        else non_RO.BAF.properties_treated[0])
+        for prop_blk in [non_RO.UF.properties_in[0], non_RO.UF.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(uf_inlet_src.flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.UF.energy_electric_flow_vol_inlet, 1)
+        iscale.set_scaling_factor(non_RO.UF.energy_membrane_replacement_flow_vol_inlet, 3)
+
+        # First translator block
+        for j in m.fs.tb_pre_main.properties_in[0].flow_mass_comp:
+            val = value(non_RO.UF.properties_treated[0].flow_mass_comp[j])
+            iscale.set_scaling_factor(m.fs.tb_pre_main.properties_in[0].flow_mass_comp[j], 1 / val)
+
+        for j in m.fs.tb_pre_main.properties_out[0].flow_mass_phase_comp:
+            val = value(m.fs.tb_pre_main.properties_out[0].flow_mass_phase_comp[j])
+            iscale.set_scaling_factor(m.fs.tb_pre_main.properties_out[0].flow_mass_phase_comp[j], 1 / val)
+        iscale.set_scaling_factor(m.fs.tb_pre_main.properties_out[0].temperature, 1e-2)
+        iscale.set_scaling_factor(m.fs.tb_pre_main.properties_out[0].pressure, 1e-5)
+
+        #### Main pump ####
+        op_pressure = RO_main.pump.control_volume.properties_out[0].pressure.value
+        iscale.set_scaling_factor(RO_main.pump.control_volume.work, 1 / (
+                op_pressure * m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value /
+                RO_main.pump.efficiency_pump[0].value))
+        iscale.set_scaling_factor(RO_main.pump.work_fluid[0], 1 / (
+                op_pressure * m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value))
+        iscale.set_scaling_factor(RO_main.pump.control_volume.properties_out[0].pressure, 1 / op_pressure)
+        iscale.set_scaling_factor(RO_main.pump.control_volume.properties_in[0].pressure, 1 / 101325)
+        iscale.set_scaling_factor(
+            RO_main.pump.control_volume.properties_out[0].flow_vol_phase["Liq"],
+            1 / m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'].value
+        )
+
+        #### RO unit (per stage) ####
+        # Physical properties are taken at the RO array feed (tb_pre_main outlet) and reused
+        # for every stage -- adequate for SCALING magnitudes. Each stage's feed flow is the
+        # previous stage's retentate, so we carry a cumulative retentate fraction down the
+        # cascade (estimated with each stage's current recovery value, ~0.5 at scaling time).
+        q_feed_tb = m.fs.tb_pre_main.properties_out[0].flow_vol_phase["Liq"].value  # RO feed vol [m3/s]
+        h2o_tb = m.fs.tb_pre_main.properties_out[0].flow_mass_phase_comp["Liq", "H2O"].value
+        tds_tb = m.fs.tb_pre_main.properties_out[0].flow_mass_phase_comp["Liq", "TDS"].value
+        dens = m.fs.tb_pre_main.properties_out[0].dens_mass_phase["Liq"].value  # kg/m3
+        visc = m.fs.tb_pre_main.properties_out[0].visc_d_phase["Liq"].value  # Pa.s
+        diff = m.fs.tb_pre_main.properties_out[0].diffus_phase_comp["Liq", "TDS"].value  # m2/s
+
+        retentate_frac = 1.0  # feed fraction reaching the current stage (1.0 for stage 1)
+        for i in RO_main.stages:
+            stage = RO_main.RO[i]
+            recovery = stage.recovery_vol_phase[0, "Liq"].value
+
+            # Stage feed-flow estimates (TDS mass ~ constant: salt is retained by every stage)
+            q_feed = q_feed_tb * retentate_frac
+            h2o_in = h2o_tb * retentate_frac
+            tds_in = tds_tb
+
+            # === Geometric parameters of RO units ===
+            iscale.set_scaling_factor(stage.length, 1e-1)
+            iscale.set_scaling_factor(stage.feed_side.channel_height, 1e3)
+            iscale.set_variable_scaling_from_current_value(stage.width)
+            calculate_variable_from_constraint(stage.area, stage.eq_area)
+            iscale.set_variable_scaling_from_current_value(stage.area)
+            calculate_variable_from_constraint(
+                stage.feed_side.area, stage.feed_side.eq_area
+            )
+            iscale.set_variable_scaling_from_current_value(stage.feed_side.area)
+            iscale.set_scaling_factor(stage.feed_side.spacer_porosity, 1)
+            iscale.set_scaling_factor(stage.A_comp[0, "H2O"], 1e12)
+            iscale.set_scaling_factor(stage.B_comp[0, "TDS"], 1e8)
+            iscale.set_scaling_factor(stage.mixed_permeate[0].pressure, 1e-5)
+            iscale.set_scaling_factor(stage.recovery_vol_phase[0, "Liq"], 2)
+
+            # === Operating conditions ===
+            hc = stage.feed_side.channel_height.value  # channel height [m]
+            width = stage.width.value  # width of the module [m]
+            length = stage.length.value  # length of the module [m]
+            porosity = stage.feed_side.spacer_porosity.value  # dimensionless
+            dh = 4 * porosity / (2 / hc + (1 - porosity) * 8 / hc)
+
+            # Inlet and outlet velocities
+            v_inlet = q_feed / (width * hc)  # inlet velocity [m/s]
+            v_exit = v_inlet * (1 - recovery)  # exit velocity [m/s]
+
+            # === Inlet calculations ===
+            # Spiral-wound Darcy friction factor (Schock & Miquel, 1987): f = 6.23 * Re^-0.3.
+            # (flat-sheet would be 0.42 + 189.3/Re.) Kept consistent with module_type=spiral_wound
+            # so the scaling factors for friction_factor_darcy / dP_dx / deltaP match the model.
+            re_in = dens * v_inlet * 2 * dh / visc
+            sc_in = visc / (dens * diff)
+            f_in = 6.23 * re_in ** -0.3
+
+            # === Exit calculations ===
+            re_out = dens * v_exit * 2 * dh / visc
+            sc_out = sc_in  # usually same properties
+            f_out = 6.23 * re_out ** -0.3
+
+            # === Average values ===
+            v_avg = 0.5 * (v_inlet + v_exit)
+            re_avg = 0.5 * (re_in + re_out)
+            f_avg = 0.5 * (f_in + f_out)
+            sc_avg = 0.5 * (sc_in + sc_out)
+
+            # === Pressure drop using Darcy-Weisbach (with averaged values) ===
+            dp_in = -dens * v_inlet ** 2 / 2 * f_in / dh  # [Pa/m]
+            dp_out = -dens * v_exit ** 2 / 2 * f_out / dh  # [Pa/m]
+            dp_avg = 0.5 * (dp_in + dp_out)  # average pressure drop [Pa/m]
+
+            # Set scaling for dimensionless numbers based on representative (inlet) values
+            for v in stage.feed_side.N_Sc_comp.values():
+                iscale.set_scaling_factor(v, 1 / sc_in)
+            for v in stage.feed_side.N_Re.values():
+                iscale.set_scaling_factor(v, 1 / re_avg)
+            for v in stage.feed_side.friction_factor_darcy.values():
+                iscale.set_scaling_factor(v, 1 / f_avg)
+            for v in stage.feed_side.N_Sh_comp.values():
+                sh_avg = re_avg ** 0.36 * sc_avg ** 0.36
+                iscale.set_scaling_factor(v, 1 / sh_avg)
+
+            for v in stage.feed_side.dP_dx.values():
+                iscale.set_scaling_factor(v, length / dp_avg)
+
+            iscale.set_scaling_factor(stage.deltaP, 1 / dp_avg)
+
+            # Feed side (bulk)
+            iscale.set_scaling_factor(stage.feed_side.properties_in[0].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in)
+            iscale.set_scaling_factor(stage.feed_side.properties_out[0].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in / (1 - recovery))
+            iscale.set_scaling_factor(stage.feed_side.properties_in[0].flow_mass_phase_comp["Liq", "TDS"],
+                                      1 / tds_in)
+            iscale.set_scaling_factor(stage.feed_side.properties_out[0].flow_mass_phase_comp["Liq", "TDS"],
+                                      1 / tds_in)
+
+            # Feed side (interface)
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 0].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in)
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 1].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in / (1 - recovery))
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 0].flow_mass_phase_comp["Liq", "TDS"],
+                                      1 / tds_in)
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 1].flow_mass_phase_comp["Liq", "TDS"],
+                                      1 / tds_in)
+
+            # Permeate side
+            iscale.set_scaling_factor(stage.permeate_side[0, 0].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in / recovery)
+            iscale.set_scaling_factor(stage.permeate_side[0, 1].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in / recovery)
+            iscale.set_scaling_factor(stage.permeate_side[0, 0].flow_mass_phase_comp["Liq", "TDS"],
+                                      100 / tds_in)
+            iscale.set_scaling_factor(stage.permeate_side[0, 1].flow_mass_phase_comp["Liq", "TDS"],
+                                      100 / tds_in)
+
+            iscale.set_scaling_factor(stage.mixed_permeate[0].flow_mass_phase_comp["Liq", "H2O"],
+                                      1 / h2o_in / recovery)
+            iscale.set_scaling_factor(stage.mixed_permeate[0].flow_mass_phase_comp["Liq", "TDS"],
+                                      100 / tds_in)
+
+            iscale.set_scaling_factor(stage.mass_transfer_phase_comp[0, "Liq", "H2O"],
+                                      1 / h2o_in / recovery)
+            iscale.set_scaling_factor(stage.mass_transfer_phase_comp[0, "Liq", "TDS"],
+                                      100 / tds_in)
+
+            iscale.set_scaling_factor(stage.feed_side.properties_in[0].flow_vol_phase["Liq"],
+                                      1 / q_feed)
+            iscale.set_scaling_factor(stage.feed_side.properties_out[0].flow_vol_phase["Liq"],
+                                      1 / q_feed / (1 - recovery))
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 0].flow_vol_phase["Liq"],
+                                      1 / q_feed)
+            iscale.set_scaling_factor(stage.feed_side.properties_interface[0, 1].flow_vol_phase["Liq"],
+                                      1 / q_feed / (1 - recovery))
+            iscale.set_scaling_factor(stage.permeate_side[0, 0].flow_vol_phase["Liq"],
+                                      1 / q_feed / recovery)
+            iscale.set_scaling_factor(stage.permeate_side[0, 1].flow_vol_phase["Liq"],
+                                      1 / q_feed / recovery)
+
+            iscale.calculate_scaling_factors(stage)
+
+            retentate_frac *= (1 - recovery)  # feed fraction passed to the next stage
+
+        # Final brine fraction (relative to RO feed) and overall system recovery estimate,
+        # used below for the ERD and the post-RO translator output flow scaling.
+        brine_frac = retentate_frac
+        sys_recovery_est = 1 - brine_frac
+
+        # Permeate mixer: each stage inlet state and the mixed state are within ~1 order of
+        # magnitude of the RO feed, so feed-magnitude scaling is adequate (mirrors the
+        # per-stage flow scaling above).
+        for i in RO_main.stages:
+            state = getattr(RO_main.P_mixer, f"stage_{i}_state")
+            iscale.set_scaling_factor(state[0].flow_mass_phase_comp["Liq", "H2O"], 1 / h2o_tb)
+            iscale.set_scaling_factor(state[0].flow_mass_phase_comp["Liq", "TDS"], 100 / tds_tb)
+        iscale.set_scaling_factor(RO_main.P_mixer.mixed_state[0].flow_mass_phase_comp["Liq", "H2O"], 1 / h2o_tb)
+        iscale.set_scaling_factor(RO_main.P_mixer.mixed_state[0].flow_mass_phase_comp["Liq", "TDS"], 100 / tds_tb)
+        iscale.calculate_scaling_factors(RO_main.P_mixer)
+
+
+        # ERD unit -- handles the final-stage retentate (brine), whose flow is the RO feed
+        # scaled by the cumulative brine fraction across all stages.
+        iscale.set_scaling_factor(
+            RO_main.ERD.control_volume.properties_in[0].flow_mass_phase_comp["Liq", "H2O"],
+            1 / h2o_tb / brine_frac
+        )
+        iscale.set_scaling_factor(
+            RO_main.ERD.control_volume.properties_out[0].flow_mass_phase_comp["Liq", "H2O"],
+            1 / h2o_tb / brine_frac
+        )
+        iscale.set_scaling_factor(
+            RO_main.ERD.control_volume.properties_in[0].flow_mass_phase_comp["Liq", "TDS"],
+            100 / tds_tb
+        )
+        iscale.set_scaling_factor(
+            RO_main.ERD.control_volume.properties_out[0].flow_mass_phase_comp["Liq", "TDS"],
+            100 / tds_tb
+        )
+
+        iscale.set_scaling_factor(RO_main.ERD.control_volume.work, 1 / (
+                op_pressure * q_feed_tb * brine_frac /
+                RO_main.ERD.efficiency_pump[0].value))
+        iscale.set_scaling_factor(RO_main.pump.work_fluid[0], 1 / (
+                op_pressure * q_feed_tb * brine_frac)
+                                  )
+        iscale.set_scaling_factor(RO_main.ERD.control_volume.properties_in[0].pressure, 1 / op_pressure)
+        iscale.set_scaling_factor(RO_main.ERD.control_volume.properties_out[0].pressure, 1 / 101325)
+        iscale.set_scaling_factor(
+            RO_main.ERD.control_volume.properties_out[0].flow_vol_phase["Liq"],
+            1 / (q_feed_tb * brine_frac)
+        )
+
+        # Second translator block
+        for j in m.fs.tb_main_post.properties_in[0].flow_mass_phase_comp:
+            val = value(m.fs.tb_main_post.properties_in[0].flow_mass_phase_comp[j])
+            iscale.set_scaling_factor(m.fs.tb_main_post.properties_in[0].flow_mass_phase_comp[j], 1 / val)
+        iscale.set_scaling_factor(m.fs.tb_main_post.properties_in[0].temperature, 1e-2)
+        iscale.set_scaling_factor(m.fs.tb_main_post.properties_in[0].pressure, 1e-5)
+
+        for j in m.fs.tb_main_post.properties_out[0].flow_mass_comp:
+            val = value(m.fs.tb_main_post.properties_out[0].flow_mass_comp[j])
+            iscale.set_scaling_factor(m.fs.tb_main_post.properties_out[0].flow_mass_comp[j], 1 / val)
+
+        iscale.set_scaling_factor(m.fs.tb_main_post.properties_out[0].flow_vol,
+                                  1 / q_feed_tb / sys_recovery_est)
+
+        #UV-AOP
+        for prop_blk in [non_RO.UV_AOP.properties_in[0], non_RO.UV_AOP.properties_treated[0]]:
+            for j in prop_blk.flow_mass_comp:
+                val = value(m.fs.tb_main_post.properties_out[0].flow_mass_comp[j])
+                iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+        iscale.set_scaling_factor(non_RO.UV_AOP.uv_dose[0], 2e-3)
+        iscale.set_scaling_factor(non_RO.UV_AOP.hydrogen_peroxide_dose[0], 1/5)
+        iscale.set_scaling_factor(non_RO.UV_AOP.chloramine_dose[0], 1 / 2.5)
+        iscale.set_scaling_factor(non_RO.UV_AOP.energy_electric_flow_vol_inlet, 10)
+
+        #Chlorimation (DPR only -- IPR has no final chlorination)
+        if treatment_train != "IPR":
+            for prop_blk in [non_RO.Cl.properties_in[0], non_RO.Cl.properties_treated[0]]:
+                for j in prop_blk.flow_mass_comp:
+                    val = value(non_RO.UV_AOP.properties_treated[0].flow_mass_comp[j])
+                    iscale.set_scaling_factor(prop_blk.flow_mass_comp[j], 1 / val)
+            iscale.set_scaling_factor(non_RO.Cl.energy_electric_flow_vol_inlet, 2e4)  # todo: check this value
+            # iscale.set_scaling_factor(non_RO.Cl.initial_chlorine_demand[0], 1)
+            iscale.set_scaling_factor(non_RO.Cl.contact_time[0], 1 / 30)
+            iscale.set_scaling_factor(non_RO.Cl.chlorine_decay_rate[0], 10)
+            iscale.set_scaling_factor(non_RO.Cl.chlorine_dose[0], 1)
+
+def initialize_system(m, treatment_train = None):
+    # initialize feed
+    m.fs.feed.initialize()
+
+    if treatment_train == "CBAT":  # non-RO DPR
+        non_RO = m.fs.non_RO
+        propagate_state(m.fs.s_non_RO_feed)
+
+        non_RO.Ozone.initialize()
+        propagate_state(non_RO.s01)
+
+        non_RO.BAF.initialize()
+        propagate_state(non_RO.s02)
+
+        non_RO.UF.initialize()
+        propagate_state(non_RO.s03)
+
+        non_RO.GAC.initialize()
+        propagate_state(non_RO.s04)
+
+        non_RO.UV_AOP.initialize()
+        propagate_state(non_RO.s05)
+
+        non_RO.Cl.initialize()
+        propagate_state(non_RO.s06)
+
+        m.fs.treated_nonRO.initialize()
+
+    elif treatment_train in ("RBAT", "IPR"):  # RO DPR / IPR
+        non_RO = m.fs.non_RO
+        RO_main = m.fs.RO_main
+
+        propagate_state(m.fs.s_RO_feed)  # feed -> Ozone (DPR) or feed -> UF (IPR)
+
+        if treatment_train != "IPR":
+            non_RO.Ozone.initialize()
+            propagate_state(non_RO.s01)
+
+            non_RO.BAF.initialize()
+            propagate_state(non_RO.s02)
+
+        non_RO.UF.initialize()
+        propagate_state(m.fs.s_UF_tb1)
+
+        m.fs.tb_pre_main.initialize()
+        propagate_state(m.fs.s_tb1_RO)
+
+        RO_main.pump.initialize()
+
+        # RO array cascade: initialize each stage on the retentate handed down from the
+        # previous stage, then push that stage's permeate into the permeate mixer.
+        for i in RO_main.stages:
+            propagate_state(getattr(RO_main, f"s_ro_in_{i}"))
+            RO_main.RO[i].initialize()
+            propagate_state(getattr(RO_main, f"s_ro_perm_{i}"))
+
+        RO_main.P_mixer.initialize()
+
+        propagate_state(RO_main.s03)
+        RO_main.ERD.initialize()
+        propagate_state(m.fs.s_disposal)
+        m.fs.brine.initialize()
+
+        propagate_state(m.fs.s_RO_tb2)
+        m.fs.tb_main_post.initialize()
+
+        propagate_state(m.fs.s_tb2_UVAOP)
+        non_RO.UV_AOP.initialize()
+
+        if treatment_train == "IPR":
+            propagate_state(m.fs.s_UVAOP_prod)
+        else:
+            propagate_state(m.fs.s_UVAOP_Cl)
+            non_RO.Cl.initialize()
+            propagate_state(m.fs.s_Cl_prod)
+        m.fs.treated_RO.initialize()
+
+    return
+
+def _setup_ozone_optimization(non_RO, state):
+    non_RO.Ozone.contact_time[0].unfix()
+    non_RO.Ozone.contact_time[0].setlb(5)
+    non_RO.Ozone.contact_time[0].setub(10)
+
+    if state == "CA":
+        if non_RO.Ozone.config.LRVO3_required == 1:
+            non_RO.Ozone.contact_time[0].fix(5)  # HRT >= 1.41889 min; max(1.41889, 5)
+        elif non_RO.Ozone.config.LRVO3_required == 2:
+            non_RO.Ozone.contact_time[0].fix(5)  # HRT >= 3.33244 min; max(3.33244, 5)
+        elif non_RO.Ozone.config.LRVO3_required == 3:
+            non_RO.Ozone.contact_time[0].fix(6.38946)  # HRT >= 6.38946 min; max(3.33244, 5)
+        else:
+            raise ConfigurationError(
+                f"LRVO3_required value cannot be greater than 3."  # LRV 4 requires at least 14.7328 min, which exceeds 10 min
+            )
+    else:
+        non_RO.Ozone.O3toTOC[0].unfix()
+        non_RO.Ozone.O3toTOC[0].setlb(0.5)
+        non_RO.Ozone.O3toTOC[0].setub(1)
+
+def _add_baf_toc_removal_constraint(m, non_RO):
+    # Constraint: removal fraction expression for toc for BAF
+    if hasattr(non_RO, "link_removal_frac_toc"):
+        non_RO.del_component("link_removal_frac_toc")
+    non_RO.link_removal_frac_toc = Constraint(
+        m.fs.time,
+        rule=lambda b, t: non_RO.BAF.removal_frac_mass_comp[t, "toc"] ==
+                          (21.9
+                           + 5.3 * (non_RO.Ozone.O3toTOC[t] - 0.48) / 0.44
+                           + 3.9 * (non_RO.BAF.EBCT[t] / pyunits.minute - 14.4) / 8.5
+                           + 1.4 * (non_RO.Ozone.O3toTOC[t] - 0.48) / 0.44 * (
+                                       non_RO.BAF.EBCT[t] / pyunits.minute - 14.4) / 8.5
+                           ) / 100
+    )
+
+def optimize_operation(m, state = None, effluent_type = None, treatment_train = None):
+    if treatment_train == "CBAT": #non-RO
+        non_RO = m.fs.non_RO
+
+        _setup_ozone_optimization(non_RO, state)
+
+        non_RO.BAF.EBCT[0].unfix()
+        non_RO.BAF.EBCT[0].setlb(20)
+        non_RO.BAF.EBCT[0].setub(30)
+
+        non_RO.BAF.removal_frac_mass_comp[0, "toc"].unfix()
+        non_RO.BAF.removal_frac_mass_comp[0, "toc"].setlb(0.0)
+        non_RO.BAF.removal_frac_mass_comp[0, "toc"].setub(1.0)
+
+        non_RO.GAC.EBCT[0].unfix()
+        non_RO.GAC.EBCT[0].setlb(10)
+        non_RO.GAC.EBCT[0].setub(20)
+
+        non_RO.GAC.required_BV[0].unfix()
+        non_RO.GAC.required_BV[0].setlb(50)
+        non_RO.GAC.required_BV[0].setub(24675)
+
+        non_RO.GAC.removal_frac_mass_comp[0, "toc"].unfix()
+        non_RO.GAC.removal_frac_mass_comp[0, "toc"].setlb(0.43)
+        non_RO.GAC.removal_frac_mass_comp[0, "toc"].setub(1.0)
+
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].unfix()
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].setlb(4.16974)
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].setub(10)
+
+        #todo should be classified into two differnet group: RBAT and CBAT
+        non_RO.UV_AOP.uv_dose[0].unfix()
+        non_RO.UV_AOP.uv_dose[0].setlb(300) # reg
+        non_RO.UV_AOP.uv_dose[0].setub(3500)
+
+        # non_RO.Cl.contact_time[0].unfix()
+        # non_RO.Cl.contact_time[0].setlb(30)
+        # non_RO.Cl.contact_time[0].setub(60)
+        #todo in RBAT initial_chlorine demand should be also considered
+
+        _add_baf_toc_removal_constraint(m, non_RO)
+
+        non_RO.toc_eff = Var(
+            units=pyunits.mg / pyunits.L,
+            initialize=1,
+            bounds=(0, 2),
+            doc="TOC effluent limit",
+        )
+
+        if state == "CA":
+            non_RO.toc_eff.fix(0.5)
+            toc_eff = pyunits.convert(non_RO.toc_eff, to_units=pyunits.kg / pyunits.m ** 3)
+        else:
+            non_RO.toc_eff.fix(2)
+            toc_eff = pyunits.convert(non_RO.toc_eff, to_units=pyunits.kg / pyunits.m ** 3)
+
+        # Constraint: TOC removal for the entire treatment train
+        if hasattr(non_RO, "total_toc_removal"):
+            non_RO.del_component("total_toc_removal")
+        non_RO.total_toc_removal = Constraint(
+            m.fs.time,
+            rule=lambda b, t: (1 - non_RO.GAC.removal_frac_mass_comp[t, "toc"]) * (
+                    1 - non_RO.BAF.removal_frac_mass_comp[t, "toc"]) ==
+                              toc_eff / (m.fs.feed.conc_mass_comp[t, "toc"] / (
+                    non_RO.Ozone.recovery_frac_mass_H2O[t] * non_RO.BAF.recovery_frac_mass_H2O[t] *
+                    non_RO.UF.recovery_frac_mass_H2O[t] * non_RO.GAC.recovery_frac_mass_H2O[t]))
+        )
+
+        # Constraint: Replacement frequency constraint
+        if hasattr(non_RO, "required_BV_constraint"):
+            non_RO.del_component("required_BV_constraint")
+        non_RO.required_BV_constraint = Constraint(
+            m.fs.time,
+            rule=lambda b, t: non_RO.GAC.required_BV[t] == (
+                    (
+                            -233248.7 * non_RO.GAC.removal_frac_mass_comp[t, "toc"] ** 3
+                            + 576888.7 * non_RO.GAC.removal_frac_mass_comp[t, "toc"] ** 2
+                            - 491370.9 * non_RO.GAC.removal_frac_mass_comp[t, "toc"]
+                            + 147842.7
+                    )
+                    * (
+                            292000 * (0.2823 * pyo.exp(-0.224 * pyunits.convert(
+                        non_RO.GAC.properties_in[t].conc_mass_comp["toc"] / (pyunits.mg / pyunits.L),
+                        to_units=pyunits.dimensionless)
+                                                       ))
+                    ) / 24962.88
+            )
+        )
+
+
+    elif treatment_train in ("RBAT", "IPR"):
+
+        non_RO = m.fs.non_RO
+
+        if treatment_train != "IPR":  # IPR has no ozone/BAC to optimize
+            _setup_ozone_optimization(non_RO, state)
+
+            non_RO.BAF.EBCT[0].unfix()
+            non_RO.BAF.EBCT[0].setlb(20 * pyunits.minute)
+            non_RO.BAF.EBCT[0].setub(30 * pyunits.minute)
+
+            non_RO.BAF.removal_frac_mass_comp[0, "toc"].unfix()
+            non_RO.BAF.removal_frac_mass_comp[0, "toc"].setlb(0.0)
+            non_RO.BAF.removal_frac_mass_comp[0, "toc"].setub(1.0)
+
+        """
+        Unfixes RO operating conditions and sets solver objective
+            - Operating pressure: 1 - 83 bar
+            - Crossflow velocity: 10 - 30 cm/s
+            - Volumetric recovery: 30 - 80 %
+            - Length: 6 - 10 m
+            - Area and width were already unfixed
+        """
+        RO_main = m.fs.RO_main
+
+        # RO operating pressure
+        RO_main.pump.control_volume.properties_out[0].pressure.unfix()
+        RO_main.pump.control_volume.properties_out[0].pressure.setub(8300000)  # pressure vessel burst pressure
+        RO_main.pump.control_volume.properties_out[0].pressure.setlb(100000)
+
+        # Per-stage RO decision variables. The single feed pump pressure (above) is shared by
+        # the cascade; velocity / length / recovery / flux are independent per stage so the
+        # optimizer can taper the array (later stages typically run lower recovery).
+        # Maximum design flux (fouling control). Cross-flow velocity bounds do NOT limit
+        # flux (flux is set by net driving pressure, Jw = A*(dP-dPi); velocity sets recovery
+        # and CP). Without this cap the cost optimum shrinks the membrane area and runs at
+        # ~38 LMH average -- ~2x the design flux for tertiary-wastewater / potable-reuse RO.
+        # Cap the AVERAGE volumetric flux at 20 LMH: GWRS (OCWD DPR plant) is designed at
+        # 20.4 LMH (12 gfd); municipal-wastewater RO design flux is ~17-20 LMH.
+        max_design_flux = pyunits.convert(
+            20 * pyunits.L / pyunits.m ** 2 / pyunits.hr, to_units=pyunits.m / pyunits.s
+        )
+        for i in RO_main.stages:
+            stage = RO_main.RO[i]
+
+            # RO inlet velocity
+            stage.feed_side.velocity[0, 0].unfix()
+            stage.feed_side.velocity[0, 0].setub(0.3)
+            stage.feed_side.velocity[0, 0].setlb(0.1)
+
+            # RO exit (concentrate) cross-flow velocity lower bound.
+            # Manufacturers cap single-pass recovery via a minimum concentrate flow / crossflow
+            # velocity (~0.1 m/s; below it the membrane-surface concentration factor exceeds ~100
+            # and flux collapses). The model otherwise only bounds the INLET velocity, so at high
+            # recovery the exit velocity (= v_in*(1-recovery)) collapses to unrealistic values
+            # (~0.05 m/s at 79% recovery). Bounding the exit velocity caps per-stage recovery to a
+            # realistic range (v_exit>=0.1, v_in<=0.3 -> recovery<=~0.67).
+            stage.feed_side.velocity[0, 1].setlb(0.1)
+
+            # RO length: 6-8 m corresponds to 6-8 spiral elements (~1 m each) in series, i.e. one
+            # standard pressure vessel. (Was 6-10; 10 m / 10 elements exceeds a standard vessel.)
+            stage.length.unfix()
+            stage.length.setub(8)
+            stage.length.setlb(6)
+
+            # RO recovery - likely limited by operating pressure.
+            # Per-stage recovery LOWER bound is tapered down the cascade: later stages see a
+            # more concentrated feed (higher osmotic pressure) under the single shared pump
+            # pressure, so demanding the same 0.30 floor as stage 1 is physically infeasible
+            # (it forces a driving pressure the shared pump cannot provide). Real tapered
+            # arrays let back stages recover less, limited by minimum-concentrate-flow and
+            # rising osmotic pressure. Floor: 0.30 for stage 1, dropping 0.10 per stage to a
+            # 0.10 minimum -> stage1 0.30, stage2 0.20, stage3+ 0.10. For n_stages=1 this is
+            # exactly the original 0.30, so single-stage behavior is unchanged.
+            recovery_lb = max(0.10, 0.30 - 0.10 * (i - 1))
+            stage.recovery_vol_phase[0, "Liq"].unfix()
+            stage.recovery_vol_phase[0, "Liq"].setub(0.90)
+            stage.recovery_vol_phase[0, "Liq"].setlb(recovery_lb)
+
+            # Per-stage TDS rejection floor, tapered down the cascade:
+            #   stage 1: 0.99, then -0.01 per stage, with a 0.95 minimum.
+            # Rationale (physics): with fixed membrane A/B, rejection is set by the net driving
+            # pressure, R = 1 - B/(A*NDP), so a floor R_min implies a minimum NDP = B/(A*(1-R_min))
+            # -- about 8.3 bar at 0.99, 4.2 bar at 0.98, 2.8 bar at 0.97. Back stages see a
+            # concentrated feed (high osmotic pressure), so demanding 0.99 there forces an applied
+            # pressure the single shared pump cannot deliver, AND pins every stage's rejection at
+            # 0.99 -> a degenerate active set that sends Ipopt to a false "locally infeasible"
+            # termination. Tapering the floor matches real arrays (back stages reject slightly
+            # less, ~0.987) and stays slack at the optimum. For n_stages=1 this is exactly 0.99,
+            # so single-stage behavior is unchanged.
+            rejection_lb = max(0.95, 0.99 - 0.01 * (i - 1))
+            stage.rejection_phase_comp[0, "Liq", "TDS"].setlb(rejection_lb)
+            # NOTE: no per-stage absolute permeate-TDS cap. Product TDS is specified once, at
+            # the system level (blended permeate <= 0.5 kg/m3, after the loop) -- that is the
+            # stream actually sent to UV-AOP/Cl. A per-stage cap on stage 1 would be redundant
+            # (for n_stages=1 the mixer has a single inlet, so the blended cap IS the stage-1
+            # permeate cap).
+
+            if hasattr(stage, "eq_max_design_flux"):
+                stage.del_component("eq_max_design_flux")
+            stage.eq_max_design_flux = Constraint(
+                expr=stage.mixed_permeate[0].flow_vol_phase["Liq"]
+                <= max_design_flux * stage.area
+            )
+
+        # System-level product-quality spec: the BLENDED RO permeate (all stages mixed, i.e.
+        # the stream actually sent to UV-AOP/Cl) must have TDS <= 0.5 kg/m3. This replaces the
+        # per-stage caps on the back stages with the physically meaningful blended spec.
+        # Redundant/slack for n_stages=1 (mixer has a single inlet = stage 1 permeate).
+        RO_main.P_mixer.mixed_state[0].conc_mass_phase_comp["Liq", "TDS"].setub(0.5)
+
+        m.fs.brine.properties[0].conc_mass_phase_comp
+
+        #UV-AOP
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].unfix()
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].setlb(2)
+        non_RO.UV_AOP.hydrogen_peroxide_dose[0].setub(10)
+
+        non_RO.UV_AOP.uv_dose[0].unfix()
+        non_RO.UV_AOP.uv_dose[0].setlb(300)  # reg
+        non_RO.UV_AOP.uv_dose[0].setub(3500)
+
+        # non_RO.Cl.contact_time[0].unfix()
+        # non_RO.Cl.contact_time[0].setlb(30)
+        # non_RO.Cl.contact_time[0].setub(60)
+
+        if treatment_train != "IPR":  # IPR TOC is met by RO rejection alone (no BAF/ozone constraint)
+            _add_baf_toc_removal_constraint(m, non_RO)
+
+    # m.fs.objective = Objective(expr=m.fs.LCOT_wo_revenue)
+    # m.fs.objective = Objective(expr=m.fs.LCOW_wo_revenue)
+    m.fs.objective = Objective(expr=m.fs.LCOW)
+
+    return
+
+def solve(blk, solver=None, tee=False, fail_flag=False):
+    # fail_flag is accepted for parameter_sweep compatibility: the sweep calls
+    # this via optimize_kwargs={"fail_flag": False}. It is intentionally not acted
+    # on here (solve never raises) so the sweep can record NaN for non-converged
+    # points and interpolate, rather than aborting the whole sweep.
+    if solver is None:
+        solver = get_solver()
+    results = solver.solve(blk, tee=tee)
+    return results
+
+def get_sweep_handles(m, treatment_train=None):
+    """Stable name -> Pyomo object registry of sensible sweep targets.
+
+    Returns a dict of three groups so a sweep can pick targets by name without
+    hard-coding model paths, and so the degree-of-freedom implication of each
+    target is explicit:
+
+      "inputs"    : quantities that are *fixed* in the optimized model. Sweeping
+                    one re-fixes it to the sample value -> DOF stays 0. Safe to
+                    sweep directly. (feed flow, feed concentrations, RO membrane
+                    transport/geometry constants, chlorine contact time.)
+      "decisions" : quantities the optimizer is free to choose (unfixed by
+                    ``optimize_operation``). Sweeping one *fixes* it, turning the
+                    optimization into a parametric study and removing one DOF; do
+                    this only deliberately (e.g. to trace an LCOW-vs-recovery
+                    curve), and be aware the result is no longer cost-optimal in
+                    that variable.
+      "costing"   : economic parameters that feed cost expressions live. Each one
+                    here was empirically verified to move LCOW on a plain re-solve
+                    (i.e. without re-running ``cost_process``), which is what a sweep
+                    does. Deliberately EXCLUDED because they do NOT propagate that
+                    way: ``capital_recovery_factor`` (a dependent var pinned by a
+                    constraint to wacc/plant_lifetime -- sweep those instead),
+                    ``recovered_water_cost`` (0 in this case study), and
+                    ``ro_costing.wacc`` (frozen value()-copy set at build).
+
+                    CAVEAT: ``wacc`` and ``utilization_factor`` exist as SEPARATE
+                    copies on zo_costing and ro_costing. The handles below touch the
+                    zo copy (and, for RBAT, ro_costing.utilization_factor separately);
+                    a "whole-plant WACC" sweep is therefore not a single handle --
+                    ro_costing.wacc will not follow. Treat these as ZO-side levers.
+
+    Note: a name may not exist for every treatment train; RO-specific handles are
+    only present for "RBAT".
+    """
+    inputs = {
+        "feed_flow": m.fs.feed.flow_vol[0],
+    }
+    for s in m.fs.prop_zo.solute_set:
+        inputs[f"feed_{s}"] = m.fs.feed.conc_mass_comp[0, s]
+
+    decisions = {
+        "uv_h2o2_dose": m.fs.non_RO.UV_AOP.hydrogen_peroxide_dose[0],
+        "uv_dose": m.fs.non_RO.UV_AOP.uv_dose[0],
+    }
+    # Ozone/BAC/Cl handles exist only for the DPR trains; IPR (UF->RO->UV/AOP) omits those units.
+    if treatment_train != "IPR":
+        inputs["cl_contact_time"] = m.fs.non_RO.Cl.contact_time[0]
+        decisions["baf_ebct"] = m.fs.non_RO.BAF.EBCT[0]
+        decisions["ozone_o3toc"] = m.fs.non_RO.Ozone.O3toTOC[0]
+
+    # All of the following were verified (probe: perturb x0.9 -> re-solve -> LCOW
+    # delta) to propagate: utilization_factor 8.0%, wacc 4.4%, TIC 4.1%,
+    # plant_lifetime 1.3%, electricity_cost 1.1%.
+    #
+    # Costing handles only exist after ``add_costing`` has built the costing blocks.
+    # Guard on their presence so this function can also be called on a freshly built
+    # (pre-costing) model to resolve just the input/decision handles -- the rescue
+    # pass in DPR_sweep_v2 relies on this to apply input values before scaling.
+    costing = {}
+    if hasattr(m.fs, "zo_costing"):
+        costing.update({
+            "electricity_cost": m.fs.zo_costing.electricity_cost,
+            "wacc": m.fs.zo_costing.wacc,
+            "plant_lifetime": m.fs.zo_costing.plant_lifetime,
+            "utilization_factor": m.fs.zo_costing.utilization_factor,
+            "TIC": m.fs.zo_costing.TIC,
+        })
+
+    if treatment_train in ("RBAT", "IPR"):
+        # Per-stage RO handles, suffixed "_s{i}". For backward compatibility the bare names
+        # ("RO_recovery", ...) alias stage 1, so single-stage sweep scripts keep working.
+        for i in m.fs.RO_main.stages:
+            stage = m.fs.RO_main.RO[i]
+            inputs[f"RO_A_comp_s{i}"] = stage.A_comp[0, "H2O"]
+            inputs[f"RO_B_comp_s{i}"] = stage.B_comp[0, "TDS"]
+            inputs[f"RO_channel_height_s{i}"] = stage.feed_side.channel_height
+            inputs[f"RO_spacer_porosity_s{i}"] = stage.feed_side.spacer_porosity
+
+            decisions[f"RO_recovery_s{i}"] = stage.recovery_vol_phase[0, "Liq"]
+            decisions[f"RO_length_s{i}"] = stage.length
+            decisions[f"RO_velocity_s{i}"] = stage.feed_side.velocity[0, 0]
+
+        stage1 = m.fs.RO_main.RO[1]
+        inputs["RO_A_comp"] = stage1.A_comp[0, "H2O"]
+        inputs["RO_B_comp"] = stage1.B_comp[0, "TDS"]
+        inputs["RO_channel_height"] = stage1.feed_side.channel_height
+        inputs["RO_spacer_porosity"] = stage1.feed_side.spacer_porosity
+
+        decisions["RO_recovery"] = stage1.recovery_vol_phase[0, "Liq"]
+        decisions["RO_length"] = stage1.length
+        decisions["RO_velocity"] = stage1.feed_side.velocity[0, 0]
+        # Single shared feed pump pressure.
+        decisions["RO_pressure"] = m.fs.RO_main.pump.control_volume.properties_out[0].pressure
+
+        # Verified to propagate: brine_disposal_cost 1.4%, membrane_cost 0.4%,
+        # electricity_cost_ro 0.7%, utilization_factor_ro 0.8%.
+        if hasattr(m.fs, "ro_costing"):
+            costing["membrane_cost"] = m.fs.ro_costing.reverse_osmosis.membrane_cost
+            costing["electricity_cost_ro"] = m.fs.ro_costing.electricity_cost
+            costing["brine_disposal_cost"] = m.fs.zo_costing.brine_disposal_cost
+            costing["utilization_factor_ro"] = m.fs.ro_costing.utilization_factor
+    elif treatment_train == "CBAT":
+        decisions["gac_ebct"] = m.fs.non_RO.GAC.EBCT[0]
+        decisions["gac_required_BV"] = m.fs.non_RO.GAC.required_BV[0]
+
+    return {"inputs": inputs, "decisions": decisions, "costing": costing}
+
+def resolve_sweep_handle(handles, name):
+    """Look a sweep-target name up across all groups returned by get_sweep_handles."""
+    for group in handles.values():
+        if name in group:
+            return group[name]
+    available = sorted(n for group in handles.values() for n in group)
+    raise KeyError(f"Unknown sweep handle '{name}'. Available: {available}")
+
+def _add_levelized_cost_expressions(m, lcow_flow, lcow_wo_flow):
+    """Add LCOT / LCOW expressions to m.fs.
+
+    LCOT and LCOT_wo_revenue are always normalized by the feed flow. LCOW and
+    LCOW_wo_revenue are normalized by the treated-water flow provided through the
+    ``lcow_flow`` / ``lcow_wo_flow`` callables (each takes the flowsheet block and
+    returns the corresponding volumetric flow), which differ by treatment train.
+    """
+    @m.fs.Expression(
+        doc="Levelized cost of treatment with respect to volumetric feed flow"
+    )
+    def LCOT(b):
+        return (
+            b.total_capital_cost * b.zo_costing.capital_recovery_factor
+            + b.total_operating_cost
+            + b.total_externalities
+        ) / (
+            pyunits.convert(
+                b.feed.properties[0].flow_vol,
+                to_units=pyunits.m ** 3 / pyunits.year,
+            )
+            * b.zo_costing.utilization_factor
+        )
+
+    @m.fs.Expression(
+        doc="Levelized cost of treatment with respect to volumetric feed flow, not including externalities"
+    )
+    def LCOT_wo_revenue(b):
+        return (
+            b.total_capital_cost * b.zo_costing.capital_recovery_factor
+            + b.total_operating_cost
+        ) / (
+            pyunits.convert(
+                b.feed.properties[0].flow_vol,
+                to_units=pyunits.m ** 3 / pyunits.year,
+            )
+            * b.zo_costing.utilization_factor
+        )
+
+    @m.fs.Expression(
+        doc="Levelized cost of water with respect to volumetric treated water flow"
+    )
+    def LCOW(b):
+        return (
+            b.total_capital_cost * b.zo_costing.capital_recovery_factor
+            + b.total_operating_cost
+            + b.total_externalities
+        ) / (
+            pyunits.convert(
+                lcow_flow(b),
+                to_units=pyunits.m ** 3 / pyunits.year,
+            )
+            * b.zo_costing.utilization_factor
+        )
+
+    @m.fs.Expression(
+        doc="Levelized cost of water with respect to volumetric treated water flow, not including externalities"
+    )
+    def LCOW_wo_revenue(b):
+        return (
+            b.total_capital_cost * b.zo_costing.capital_recovery_factor
+            + b.total_operating_cost
+        ) / (
+            pyunits.convert(
+                lcow_wo_flow(b),
+                to_units=pyunits.m ** 3 / pyunits.year,
+            )
+            * b.zo_costing.utilization_factor
+        )
+
+def add_costing(m, treatment_train=None):
+    # Zero order costing
+    source_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "nonRO_DPR_global_costing.yaml",
+    )
+
+    if treatment_train == "CBAT":  # non-RO DPR costing
+        non_RO = m.fs.non_RO
+        m.fs.zo_costing = ZeroOrderCosting(case_study_definition=source_file)
+
+        # non-RO DPR: cost of each unit process
+        non_RO.Ozone.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.BAF.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.UF.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.GAC.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.UV_AOP.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.Cl.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+
+        # Aggregate unit level costs and calculate overall process costs
+        m.fs.zo_costing.cost_process()
+
+        feed_flowrate = m.fs.feed.flow_vol[0]
+        m.fs.zo_costing.add_electricity_intensity(feed_flowrate)
+        m.fs.specific_energy_intensity = Expression(
+            expr=(m.fs.zo_costing.electricity_intensity),
+            doc="Specific energy consumption of the non-RO DPR treatment train on a feed flowrate basis [kWh/m3]",
+        )
+
+        # Water recovery revenue
+        # TODO: check recovered_water_cost for BAF, UF, and GAC byproduct (backwash); currently this value is based on dye_desalination yaml file
+        m.fs.water_recovery_revenue = Expression(
+            expr=(
+                    -1 * m.fs.zo_costing.utilization_factor
+                    * m.fs.zo_costing.recovered_water_cost
+                    * pyunits.convert(
+                m.fs.byproduct_BAF.properties[0].flow_vol
+                + m.fs.byproduct_UF.properties[0].flow_vol
+                + m.fs.byproduct_GAC.properties[0].flow_vol,
+                    to_units=pyunits.m ** 3 / m.fs.zo_costing.base_period,
+                )
+            ),
+            doc="Savings from water recovered (BAF, UF, and GAC backwashed water (byproduct)) back to the plant",
+        )
+
+        # Combine results from costing packages and calculate overall metrics
+        @m.fs.Expression(doc="Total capital cost of the non-RO DPR treatment train")
+        def total_capital_cost(b):
+            return pyunits.convert(
+                m.fs.zo_costing.total_capital_cost, to_units=pyunits.USD_2020
+            )
+
+        @m.fs.Expression(doc="Total operating cost of the non-RO DPR treatment train")
+        def total_operating_cost(b):
+            return pyunits.convert(
+                m.fs.zo_costing.total_fixed_operating_cost,
+                to_units=pyunits.USD_2020 / pyunits.year,
+            ) + pyunits.convert(
+                m.fs.zo_costing.total_variable_operating_cost,
+                to_units=pyunits.USD_2020 / pyunits.year,
+            )
+
+        @m.fs.Expression(doc="Total cost of water recovery")
+        def total_externalities(b): # can be either - or +
+            return pyunits.convert(m.fs.water_recovery_revenue, to_units=pyunits.USD_2020 / pyunits.year)
+
+        _add_levelized_cost_expressions(
+            m,
+            lcow_flow=lambda b: b.treated_nonRO.properties[0].flow_vol,
+            lcow_wo_flow=lambda b: b.treated_nonRO.properties[0].flow_vol,
+        )
+
+    elif treatment_train in ("RBAT", "IPR"):  # RO DPR / IPR costing
+        non_RO = m.fs.non_RO
+        # RO_post = m.fs.RO_post
+        m.fs.zo_costing = ZeroOrderCosting(case_study_definition=source_file)
+        m.fs.ro_costing = WaterTAPCosting()
+
+
+        # RO DPR / IPR: cost of each non-RO unit. IPR has only UF + UV/AOP (no ozone/BAC/Cl).
+        if treatment_train != "IPR":
+            non_RO.Ozone.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+            non_RO.BAF.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.UF.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        non_RO.UV_AOP.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+        if treatment_train != "IPR":
+            non_RO.Cl.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.zo_costing)
+
+        # Aggregate unit level costs and calculate overall process costs
+        m.fs.zo_costing.cost_process()
+
+        feed_flowrate = m.fs.feed.flow_vol[0]
+        m.fs.zo_costing.add_electricity_intensity(feed_flowrate)
+
+        # RO DPR: cost of RO (RO_main)
+        # RO equipment is costed using more detailed costing package
+        RO_main = m.fs.RO_main
+        RO_main.pump.costing = UnitModelCostingBlock(
+            flowsheet_costing_block=m.fs.ro_costing,
+            costing_method_arguments={"cost_electricity_flow": True},
+        )
+        # One costing block per RO stage (membrane capital cost scales with each stage's area).
+        for i in RO_main.stages:
+            RO_main.RO[i].costing = UnitModelCostingBlock(
+                flowsheet_costing_block=m.fs.ro_costing
+            )
+
+        RO_main.ERD.costing = UnitModelCostingBlock(
+            flowsheet_costing_block=m.fs.ro_costing,
+            costing_method_arguments={"cost_electricity_flow": True},
+        )
+
+        # todo: need to set up costing factors
+        m.fs.ro_costing.base_currency = pyunits.USD_2020
+        m.fs.ro_costing.electricity_cost = value(m.fs.zo_costing.electricity_cost)
+        m.fs.ro_costing.wacc = value(m.fs.zo_costing.wacc)
+        m.fs.ro_costing.plant_lifetime = value(m.fs.zo_costing.plant_lifetime)
+        m.fs.ro_costing.utilization_factor = value(m.fs.zo_costing.utilization_factor)
+
+        m.fs.ro_costing.maintenance_labor_chemical_factor = value(m.fs.zo_costing.maintenance_labor_chemical_factor)
+        m.fs.ro_costing.TIC = value(m.fs.zo_costing.TIC)
+        m.fs.ro_costing.total_investment_factor = value(
+            m.fs.zo_costing.total_investment_factor)  # 3 / m.fs.costing.TIC.value
+
+        m.fs.ro_costing.reverse_osmosis.membrane_cost.fix(30 * m.fs.ro_costing.total_investment_factor.value)
+        m.fs.ro_costing.reverse_osmosis.factor_membrane_replacement.fix(
+            0 * m.fs.ro_costing.utilization_factor.value)  # utilization factor should be considered
+                                                             # because it is not considered for fixed_operating_cost
+                                                             # but it should be considered for flow_cost
+        m.fs.RO_main.pump.costing.costing_package.high_pressure_pump.unit_cost.fix(
+            53 / 1e5 * 3600 * m.fs.ro_costing.total_investment_factor.value)
+        m.fs.RO_main.ERD.costing.costing_package.energy_recovery_device.unit_cost.fix(
+            535 * m.fs.ro_costing.total_investment_factor.value)
+
+        # RO_membrane_replacement_expr = Expression(
+        #     expr=(
+        #         # m.fs.ro_costing.reverse_osmosis.factor_membrane_replacement
+        #         pyo.units.convert(0.2 * pyo.units.year ** -1
+        #                           * m.fs.ro_costing.reverse_osmosis.membrane_cost
+        #                           * m.fs.RO_main.RO.area,
+        #                           to_units=m.fs.ro_costing.base_currency / m.fs.ro_costing.base_period)
+        #     )
+        # )
+        #
+        # m.fs.ro_costing.register_flow_type("membrane_replacement", RO_membrane_replacement_expr)
+        # m.fs.ro_costing.cost_flow(m.fs.RO_main.RO.area, "membrane_replacement")
+
+        membrane_replacement_ro = pyo.units.convert(
+            (0.2 / pyo.units.year) * m.fs.ro_costing.reverse_osmosis.membrane_cost,
+            to_units=(
+                    m.fs.ro_costing.base_currency
+                    / m.fs.ro_costing.base_period
+                    / pyo.units.m ** 2
+            ),
+        )
+
+        m.fs.ro_costing.register_flow_type("membrane_replacement", membrane_replacement_ro)
+        # Membrane replacement scales with total membrane area summed over all stages.
+        m.fs.ro_costing.cost_flow(
+            sum(m.fs.RO_main.RO[i].area for i in m.fs.RO_main.stages),
+            "membrane_replacement",
+        )
+
+        m.fs.ro_costing.cost_process()
+        m.fs.ro_costing.add_specific_energy_consumption(feed_flowrate)
+
+        m.fs.specific_energy_intensity = Expression(
+            expr=(
+                    m.fs.zo_costing.electricity_intensity
+                    + m.fs.ro_costing.specific_energy_consumption
+            ),
+            doc="Specific energy consumption of the RO DPR treatment train on a feed flowrate basis [kWh/m3]",
+        )
+
+
+        # Water recovery revenue
+        # TODO: check recovered_water_cost for UF byproduct (backwash); currently this value is based on dye_desalination yaml file
+        # Recovered backwash byproduct: UF for all RO trains, plus BAF for the DPR trains (IPR has no BAF).
+        recovered_byproduct_flow = m.fs.byproduct_UF.properties[0].flow_vol
+        if treatment_train != "IPR":
+            recovered_byproduct_flow = recovered_byproduct_flow + m.fs.byproduct_BAF.properties[0].flow_vol
+        m.fs.water_recovery_revenue = Expression(
+            expr=(
+                    -1 * m.fs.zo_costing.utilization_factor
+                    * m.fs.zo_costing.recovered_water_cost
+                    * pyunits.convert(
+                recovered_byproduct_flow,
+                to_units=pyunits.m ** 3 / m.fs.zo_costing.base_period
+            )),
+            doc="Savings from water recovered (UF -- and BAF for DPR -- backwash byproduct) back to the plant",
+        )
+
+        m.fs.brine_disposal_cost = Expression(
+            expr=(
+                    1 * m.fs.zo_costing.utilization_factor
+                    * m.fs.zo_costing.brine_disposal_cost
+                    * pyunits.convert(
+                m.fs.brine.properties[0].flow_vol,
+                to_units=pyunits.m ** 3 / m.fs.zo_costing.base_period
+            )),
+            doc="Cost of brine disposal",
+        )
+
+        # Combine results from costing packages and calculate overall metrics
+        @m.fs.Expression(doc="Total capital cost of the RO DPR treatment train")
+        def total_capital_cost(b):
+            return pyunits.convert(
+                m.fs.zo_costing.total_capital_cost, to_units=pyunits.USD_2020
+            ) + pyunits.convert(
+                m.fs.ro_costing.total_capital_cost, to_units=pyunits.USD_2020
+            )
+
+
+        @m.fs.Expression(doc="Total operating cost of the RO DPR treatment train")
+        def total_operating_cost(b):
+            return pyunits.convert(
+                m.fs.zo_costing.total_fixed_operating_cost,
+                to_units=pyunits.USD_2020 / pyunits.year
+            ) + pyunits.convert(
+                m.fs.zo_costing.total_variable_operating_cost,
+                to_units=pyunits.USD_2020 / pyunits.year
+            ) + pyunits.convert(
+                m.fs.ro_costing.total_operating_cost,
+                to_units=pyunits.USD_2020 / pyunits.year,
+            )
+
+        @m.fs.Expression(doc="Total cost of water recovery")
+        def total_externalities(b):  # can be either - or +
+            return (
+                pyunits.convert(
+                    m.fs.water_recovery_revenue
+                    + m.fs.brine_disposal_cost,
+                    to_units=pyunits.USD_2020 / pyunits.year,
+                )
+            )
+
+        _add_levelized_cost_expressions(
+            m,
+            lcow_flow=lambda b: b.treated_RO.properties[0].flow_vol,
+            lcow_wo_flow=lambda b: b.RO_main.P_mixer.mixed_state[0].flow_vol_phase['Liq'],
+        )
+
+    return
+
+def initialize_costing(m, treatment_train=None):
+    if treatment_train == "CBAT":
+        m.fs.zo_costing.initialize()
+    elif treatment_train in ("RBAT", "IPR"):
+        m.fs.zo_costing.initialize()
+        m.fs.ro_costing.initialize()
+    return
+
+def cost_output(m, treatment_train=None):
+    flow_types = m.fs.zo_costing.used_flows
+    util_zo = m.fs.zo_costing.utilization_factor
+    mlc_zo = m.fs.zo_costing.maintenance_labor_chemical_factor
+    tif_zo = m.fs.zo_costing.total_investment_factor
+    flow_cost_params = {ft: getattr(m.fs.zo_costing, f"{ft}_cost") for ft in flow_types}
+
+    unit_blocks_zo = {
+        name: blk for name, blk in m.fs.non_RO.component_map(Block).items()
+        if isinstance(blk, UnitModelBlockData)
+    }
+
+    capex_blocks_zo = {
+        cb.parent_block().local_name: cb for cb in m.fs.zo_costing._registered_unit_costing
+    }
+
+    results = {}
+    zero_usd_per_year = 0 * (pyunits.USD_2020 / pyunits.year)
+
+    for unit_name, unit_block in unit_blocks_zo.items():
+        if unit_name not in capex_blocks_zo:
+            continue
+
+        cb = capex_blocks_zo[unit_name]
+        capex = pyunits.convert(cb.capital_cost * tif_zo * m.fs.zo_costing.capital_recovery_factor , to_units=pyunits.USD_2020/pyunits.year)  # stays with units
+
+        # Flow OPEX (electricity / chemicals / etc. defined as per-flow costs)
+        flow_total = zero_usd_per_year
+        for ft in flow_types:
+            if hasattr(unit_block, ft):
+                var = getattr(unit_block, ft)
+                v = var[0] if var.is_indexed() else var
+                flow_cost_val = pyunits.convert(
+                    v * flow_cost_params[ft] * util_zo,
+                    to_units=pyunits.USD_2020 / pyunits.year
+                )
+                print(f"  {ft:<15} : {value(flow_cost_val):,.3f} {pyunits.get_units(flow_cost_val)}")
+                flow_total += flow_cost_val
+
+        mlc_cost = pyunits.convert(mlc_zo * capex / m.fs.zo_costing.capital_recovery_factor / tif_zo, to_units=pyunits.USD_2020/pyunits.year)
+        opex = flow_total + mlc_cost
+
+        results[unit_name] = {"capex": capex, "opex": opex}
+
+    # RO aggregate (RBAT / IPR -- both have the RO_main + ro_costing block)
+    if treatment_train in ("RBAT", "IPR"):
+        # CAPEX: sum all RO unit capital costs * RO total investment factor
+        tif_ro = m.fs.ro_costing.total_investment_factor
+        mlc_ro = m.fs.ro_costing.maintenance_labor_chemical_factor
+        capex_ro = 0 * pyunits.USD_2020
+        for cb in m.fs.ro_costing._registered_unit_costing:
+            capex_ro += pyunits.convert(cb.capital_cost * tif_ro * m.fs.ro_costing.capital_recovery_factor, to_units=pyunits.USD_2020/pyunits.year)
+
+        # Flow OPEX: pump + ERD electricity (annualized) + membrane replacement (aggregate fixed O&M)
+        t0 = m.fs.time.first()
+        hours_per_year = 8766 * pyunits.h / pyunits.a
+        elec_price_ro = m.fs.ro_costing.electricity_cost
+        util_ro = m.fs.ro_costing.utilization_factor
+
+        flow_ro = 0 * (pyunits.USD_2020 / pyunits.year)
+
+        # Electricity from mechanical work (pump & ERD)
+        # for blk in (m.fs.RO_main.pump, m.fs.RO_main.ERD):
+        #     if hasattr(blk, "control_volume") and hasattr(blk.control_volume, "work"):
+        #         power_kW = pyunits.convert(blk.control_volume.work[t0], to_units=pyunits.kW)
+        #         annual_kWh = power_kW * hours_per_year
+        #         flow_ro += annual_kWh * elec_price_ro * util_ro
+        flow_ro += pyunits.convert(m.fs.ro_costing.aggregate_flow_costs["electricity"] * util_ro, to_units=pyunits.USD_2020/pyunits.year)
+
+        # Membrane replacement (aggregate fixed O&M already in RO costing)
+        # memrep = pyunits.convert(
+        #     m.fs.ro_costing.aggregate_fixed_operating_cost,
+        #     to_units=pyunits.USD_2020 / pyunits.year
+        # )
+        # flow_ro += memrep
+        flow_ro += pyunits.convert(m.fs.ro_costing.aggregate_flow_costs["membrane_replacement"] * util_ro,
+                                   to_units=pyunits.USD_2020 / pyunits.year)
+
+        # MLC-based fixed O&M for RO (applied to aggregated RO CAPEX)
+        mlc_ro_cost = mlc_ro * capex_ro/ m.fs.ro_costing.capital_recovery_factor / tif_ro
+        opex_ro = flow_ro + mlc_ro_cost
+        brine_cost = pyunits.convert(m.fs.brine_disposal_cost, to_units=pyunits.USD_2020 / pyunits.year)
+
+        results["RO"] = {"capex": capex_ro, "opex": opex_ro}
+        results["Brine"] = {"capex": 0, "opex": brine_cost}
+
+    return results
+
+def display_cost_output(m, treatment_train=None):
+    res = cost_output(m, treatment_train=treatment_train)
+
+    # Safe totals: start with a quantity that has units
+    total_capex = 0 * pyunits.USD_2020 / pyunits.year
+    total_opex = 0 * (pyunits.USD_2020 / pyunits.year)
+
+    print("\n---------- Unit CAPEX & OPEX ----------")
+    print(f"{'Unit':<24} {'CAPEX (MUSD_2020/yr)':>20} {'OPEX (MUSD_2020/yr)':>24}")
+    print("-" * 72)
+
+    for unit_name, costs in res.items():
+        capex = costs["capex"]
+        opex = costs["opex"]
+        total_capex += capex
+        total_opex += opex
+        print(f"{unit_name:<24} {value(capex / 1e6):>20,.3f} {value(opex / 1e6):>24,.3f}")
+
+    print("-" * 72)
+    print(f"{'TOTAL':<24} {value(total_capex / 1e6):>20,.3f} {value(total_opex / 1e6):>24,.3f}")
+    # m.fs.ro_costing.pprint()
+
+def _print_flow_rates(m, unit_models):
+    print("\nFeed flow rate in each unit process")
+    print(
+        f"Feed flow rate: {value(pyunits.convert(m.fs.feed.flow_vol[0], to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+    for unit_name, unit_block in unit_models.items():
+        unit_flow_rate = value(
+            pyunits.convert(unit_block.properties_in[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day))
+        print(f"Feed flow rate in {unit_name}: {unit_flow_rate: .3f} MGD")
+
+def _print_system_recovery(m, product):
+    sys_water_recovery = (
+            product.properties[0].flow_mass_comp["H2O"]()
+            / m.fs.feed.flow_mass_comp[0, "H2O"]()
+    )
+    print(f"System water recovery: {sys_water_recovery * 100 : .3f}%")
+
+    for solute in m.fs.prop_zo.solute_set:
+        sys_recovery = (
+                product.properties[0].flow_mass_comp[solute]()
+                / m.fs.feed.flow_mass_comp[0, solute]()
+        )
+        print(f"System {solute} recovery: {sys_recovery * 100: .9f}%")
+
+def _print_op_conditions_ozone_baf_uf(m):
+    # Ozone and BAF exist only for the DPR trains (IPR omits them); UF is common to all RO trains.
+    if hasattr(m.fs.non_RO, "Ozone"):
+        print(
+            f"Operating conditions (Ozone): "
+            f"O3:TOC = {value(m.fs.non_RO.Ozone.O3toTOC[0]):.3f}, "
+            f"Contact Time = {value(pyunits.convert(m.fs.non_RO.Ozone.contact_time[0], to_units=pyunits.min)):.3f} min, "
+            f"Ozone Dose= {value(pyunits.convert(m.fs.non_RO.Ozone.ozone_consumption[0], to_units=(pyunits.mg / pyunits.liter))):.3f} mg/L, "
+            f"Residual O3= {(0.704 * value(m.fs.non_RO.Ozone.O3toTOC[0]) + 1.136) * value(pyo.exp(-m.fs.non_RO.Ozone.kO3[0] * (m.fs.non_RO.Ozone.contact_time[0] - 0.5 * pyunits.min))):.3f} mg/L, "
+
+        )
+
+    if hasattr(m.fs.non_RO, "BAF"):
+        print(
+            f"Operating conditions (BAF): "
+            f"EBCT = {value(pyunits.convert(m.fs.non_RO.BAF.EBCT[0], to_units=pyunits.min)):.3f} min, "
+            f"TOC removal (%) = {value(m.fs.non_RO.BAF.removal_frac_mass_comp[0, 'toc']) * 100:.2f}%, "
+            f"TOC level in BAF influent = {value(pyunits.convert(m.fs.non_RO.BAF.properties_in[0].conc_mass_comp['toc'], to_units=pyunits.mg / pyunits.L)):.3f} mg/L"
+        )
+
+    print(
+        f"Operating conditions (UF): "
+        f"TOC removal (%) = {value(m.fs.non_RO.UF.removal_frac_mass_comp[0, 'toc']) * 100:.2f}%, "
+        f"TOC level in UF influent = {value(pyunits.convert(m.fs.non_RO.UF.properties_in[0].conc_mass_comp['toc'], to_units=pyunits.mg / pyunits.L)):.3f} mg/L"
+    )
+
+def _print_op_conditions_uvaop_cl(m):
+    print(
+        f"Operating conditions (UV-AOP): "
+        f"H2O2 dose = {value(pyunits.convert(m.fs.non_RO.UV_AOP.hydrogen_peroxide_dose[0], to_units=pyunits.mg /pyunits.L)):.3f} mg/L, "
+        f"UV dose = {value(pyunits.convert(m.fs.non_RO.UV_AOP.uv_dose[0], to_units=pyunits.mJ /pyunits.cm **2)):.3f} mJ/cm2"
+    )
+
+    if not hasattr(m.fs.non_RO, "Cl"):  # IPR has no final chlorination
+        return
+    print(
+        f"Operating conditions (Cl): "
+        f"Cl dose = {value(pyunits.convert(m.fs.non_RO.Cl.chlorine_dose[0], to_units=pyunits.mg / pyunits.L)):.3f} mg/L, "
+        f"Contact time = {value(pyunits.convert(m.fs.non_RO.Cl.contact_time[0], to_units=pyunits.min)):.3f} min, "
+        f"Residual Cl = {value(pyunits.convert(m.fs.non_RO.Cl.chlorine_dose[0] + m.fs.non_RO.Cl.initial_chlorine_demand[0], to_units=pyunits.mg / pyunits.L)) * value(pyo.exp(-m.fs.non_RO.Cl.chlorine_decay_rate[0] * value(pyunits.convert(m.fs.non_RO.Cl.contact_time[0], to_units=pyunits.hour)))) :.3f} mg/L"
+    )
+
+def display_results(m, treatment_train=None):
+    # for comp in m.fs.prop_zo.component_list:
+    #     print(comp)
+    # m.fs.feed.report()
+    # m.fs.feed.properties.report()
+    print("flow_vol:", pyo.value(m.fs.feed.properties[0].flow_vol)) # param or expression으로 계산된값
+    print("flow_vol:", pyo.value(m.fs.feed.flow_vol[0])) # 우리가 지정한 값
+
+    print("conc_mass_comp H2O:", pyo.value(m.fs.feed.properties[0].conc_mass_comp["H2O"])) # param or expression으로 계산된값
+    print("conc_mass_comp toc:", pyo.value(m.fs.feed.properties[0].conc_mass_comp["toc"])) # param or expression으로 계산된값
+    print("conc_mass_comp toc:", pyo.value(m.fs.feed.conc_mass_comp[0, "toc"])) # 우리가 지정한 값
+    # print("conc_mass_comp h2o:", pyo.value(m.fs.feed.conc_mass_comp[0, "H2O"]))
+
+    print("flow_mass_comp H2O:", pyo.value(m.fs.feed.properties[0].flow_mass_comp["H2O"])) # Var로 선언된 값이고 (m.fs.feed.properties stateblock에)
+                                                                                           # feedZO 에서 feed.flow_vol과 conc_mass_comp로 계산되는 값
+    print("flow_mass_comp H2O:", pyo.value(m.fs.feed.flow_mass_comp[0, "H2O"])) # feed.py의 reference를 통해 properties[0].flow_mass_comp가 ref된 것
+
+    print("dens_mass:", pyo.value(m.fs.feed.properties[0].dens_mass))
+    # m.fs.feed.properties.display()
+    # m.fs.feed.properties[0].display()
+    # m.fs.feed.properties[0].report()
+
+    unit_models = {name: block for name, block in m.fs.non_RO.component_map(Block).items() if
+                   isinstance(block, UnitModelBlockData)}
+
+    if treatment_train == "CBAT":
+        print("\n----------Unit models ----------")
+        _print_flow_rates(m, unit_models)
+
+        # Overall system recovery
+        print("\n----------System Recovery (non-RO DPR)----------\n")
+        _print_system_recovery(m, m.fs.treated_nonRO)
+
+        _print_op_conditions_ozone_baf_uf(m)
+
+        print(
+            f"Operating conditions (GAC): "
+            f"EBCT = {value(pyunits.convert(m.fs.non_RO.GAC.EBCT[0], to_units=pyunits.min)):.3f} min, "
+            f"Replacement_frequnecy = {value(pyunits.convert(m.fs.non_RO.GAC.replacement_frequency[0], to_units=pyunits.min)):.3f} min, "
+            f"Required_BV = {value(m.fs.non_RO.GAC.required_BV[0]):.3f} BV, "
+            f"TOC removal (%) = {value(m.fs.non_RO.GAC.removal_frac_mass_comp[0, 'toc']) * 100:.2f}%, "
+            f"TOC level in GAC influent = {value(pyunits.convert(m.fs.non_RO.GAC.properties_in[0].conc_mass_comp['toc'],to_units=pyunits.mg /pyunits.L)):.3f} mg/L, "
+            f"TOC level in GAC effluent = {value(pyunits.convert(m.fs.non_RO.GAC.properties_treated[0].conc_mass_comp['toc'], to_units=pyunits.mg / pyunits.L)):.3f} mg/L"
+        )
+
+        _print_op_conditions_uvaop_cl(m)
+
+
+    if treatment_train in ("RBAT", "IPR"):
+        print(f"\n----------Unit models in RO {'IPR' if treatment_train == 'IPR' else 'DPR'} ----------")
+        # m.fs.RO_main.RO.report()
+        _print_flow_rates(m, unit_models)
+
+        print(
+            f"Outlet flow rate of UF: {value(pyunits.convert(m.fs.non_RO.UF.properties_treated[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"Flow rate of inlet of tb1: {value(pyunits.convert(m.fs.tb_pre_main.properties_in[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"Flow rate of outlet of tb1: {value(pyunits.convert(m.fs.tb_pre_main.properties_out[0].flow_vol_phase['Liq'], to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"Feed flow rate in RO (stage 1): {value(pyunits.convert(m.fs.RO_main.RO[1].feed_side.properties[0, 0].flow_vol_phase['Liq'], to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"density in RO (stage 1): {value(pyunits.convert(m.fs.RO_main.RO[1].feed_side.properties[0, 0].dens_mass_phase['Liq'], to_units=pyunits.kg / pyunits.m**3)): .3f} kg/m3")
+
+        print(
+            f"Flow rate of RO permeate (mixed): {value(pyunits.convert(m.fs.RO_main.P_mixer.mixed_state[0].flow_vol_phase['Liq'], to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"Flow rate of UV-AOP: {value(pyunits.convert(m.fs.non_RO.UV_AOP.properties_treated[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        if hasattr(m.fs.non_RO, "Cl"):
+            print(
+                f"Flow rate of Cl: {value(pyunits.convert(m.fs.non_RO.Cl.properties_treated[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+        print(
+            f"Flow rate of product: {value(pyunits.convert(m.fs.treated_RO.properties[0].flow_vol, to_units=pyunits.Mgallons / pyunits.day)): .3f} MGD")
+
+        # Overall system recovery
+        print("\n----------System Recovery (RO DPR)----------\n")
+        _print_system_recovery(m, m.fs.treated_RO)
+
+        _print_op_conditions_ozone_baf_uf(m)
+
+        print(
+            f"Operating conditions (RO): "
+            f"Operating pressure_pump1 (bar) = {value(pyunits.convert(m.fs.RO_main.pump.control_volume.properties_out[0].pressure,to_units=pyunits.bar)):.2f} bar"
+        )
+        total_area = 0.0
+        for i in m.fs.RO_main.stages:
+            stage = m.fs.RO_main.RO[i]
+            total_area += value(pyunits.convert(stage.area, to_units=pyunits.m**2))
+            print(
+                f"  [stage {i}] "
+                f"velocity (m/s) = {value(pyunits.convert(stage.feed_side.velocity[0, 0], to_units=pyunits.m / pyunits.s)):.3f}, "
+                f"area (m2) = {value(pyunits.convert(stage.area, to_units=pyunits.m**2)):.3f}, "
+                f"recovery (%) = {value(stage.recovery_vol_phase[0, 'Liq'])*100:.3f}, "
+                f"width (m) = {value(pyunits.convert(stage.width, to_units=pyunits.m)):.3f}, "
+                f"length (m) = {value(pyunits.convert(stage.length, to_units=pyunits.m)):.3f}"
+            )
+        print(f"  Total membrane area (all stages) = {total_area:.3f} m2")
+        print(f"  System RO recovery (%) = {value(m.fs.RO_main.sys_recovery_vol)*100:.3f}")
+
+
+        _print_op_conditions_uvaop_cl(m)
+
+def _print_normalized_costs(m, capex, opex, wrr, wrr_unit_label):
+    externalities = value(pyunits.convert(m.fs.total_externalities, to_units=pyunits.MUSD_2020 / pyunits.year))
+
+    # normalized costs
+    feed_flowrate = value(
+        pyunits.convert(
+            m.fs.feed.properties[0].flow_vol, to_units=pyunits.m ** 3 / pyunits.hr
+        )
+    )
+
+    capex_norm = (
+            value(pyunits.convert(m.fs.total_capital_cost, to_units=pyunits.USD_2020))
+            / feed_flowrate
+    )
+
+    annual_investment = value(
+        pyunits.convert(
+            m.fs.total_capital_cost * m.fs.zo_costing.capital_recovery_factor
+            + m.fs.total_operating_cost,
+            to_units=pyunits.USD_2020 / pyunits.year,
+        )
+    )
+
+    opex_fraction = (
+            100
+            * value(
+        pyunits.convert(
+            m.fs.total_operating_cost, to_units=pyunits.USD_2020 / pyunits.year
+        )
+    )
+            / annual_investment
+    )
+
+    lcot = value(pyunits.convert(m.fs.LCOT, to_units=pyunits.USD_2020 / pyunits.m ** 3))
+    lcot_wo_revenue = value(pyunits.convert(m.fs.LCOT_wo_revenue, to_units=pyunits.USD_2020 / pyunits.m ** 3))
+    lcow = value(pyunits.convert(m.fs.LCOW, to_units=pyunits.USD_2020 / pyunits.m ** 3))
+    lcow_wo_revenue = value(pyunits.convert(m.fs.LCOW_wo_revenue, to_units=pyunits.USD_2020 / pyunits.m ** 3))
+    sec = m.fs.specific_energy_intensity()
+    #
+    print(f"\nTotal Capital Cost: {capex:.4f} M$")
+    print(f"\nTotal Operating Cost: {opex:.4f} M$/year")
+    print(f"\nTotal Externalities: {externalities:.4f} M$/year")
+    print(f"Water Recovery Revenue: {wrr: .4f} {wrr_unit_label}")
+    print(f"\nTotal Annual Cost: {annual_investment : .4f} $/year")
+    print(f"Normalized Capital Cost: {capex_norm:.4f} $/(m3feed/hr)")
+    print(f"Opex Fraction of Annual Cost:{opex_fraction : .4f} %")
+    print(f"Levelized cost of treatment: {lcot:.4f} $/m3feed")
+    print(f"Levelized cost of treatment without revenue: {lcot_wo_revenue:.4f} $/m3feed")
+    print(f"Levelized cost of water: {lcow:.4f} $/m3treated")
+    print(f"Levelized cost of water without revenue: {lcow_wo_revenue:.4f} $/m3treated")
+    print(f"Specific energy intensity (given inlet flow): {sec:.3f} kWh/m3feed")
+
+def display_cost(m, treatment_train=None):
+    if treatment_train == "CBAT":
+        # Capex
+        print("\n----------System costing metrics----------\n")
+        capex = value(pyunits.convert(m.fs.total_capital_cost, to_units=pyunits.MUSD_2020))
+        print(f"Total Capital Cost: {capex:.4f} M$")
+        print(f"Base currency: {m.fs.zo_costing.base_currency}")
+        print(f"Base currency factor: {value(pyunits.convert(1 * pyunits.USD_2014, to_units=pyunits.USD_2020))}")
+
+        print("\n----------Unit Capital Costs----------")
+        total_unit_capex_cal = 0
+        for u in m.fs.zo_costing._registered_unit_costing:
+            unit_name = u.parent_block().local_name
+            print(
+                f"{unit_name} capital cost: {value(pyunits.convert(u.capital_cost*m.fs.zo_costing.total_investment_factor, to_units=pyunits.MUSD_2020)):.4f} M$")
+            total_unit_capex_cal += value(pyunits.convert(u.capital_cost*m.fs.zo_costing.total_investment_factor, to_units=pyunits.MUSD_2020))
+        print(f"(Calculated) Sum of capital costs of unit processes: {total_unit_capex_cal:.4f} M$")
+        print("---------------------------")
+
+        # Opex
+        opex = value(pyunits.convert(m.fs.total_operating_cost, to_units=pyunits.MUSD_2020 / pyunits.year))
+        total_fixed_operating_cost = value(pyunits.convert(m.fs.zo_costing.total_fixed_operating_cost,
+                                                           to_units=pyunits.MUSD_2020 / pyunits.year))
+        total_variable_operating_cost = value(pyunits.convert(m.fs.zo_costing.total_variable_operating_cost,
+                                                              to_units=pyunits.MUSD_2020 / pyunits.year))
+        # brine_disposal_cost = value(pyunits.convert(m.fs.brine_disposal_cost,
+        #                                                       to_units=pyunits.MUSD_2020 / pyunits.year))
+        print(f"\nTotal Operating Cost (Cop,tot): {opex:.4f} M$/year")
+        print(f"Total fixed operating cost (Cop,fix): {total_fixed_operating_cost:.4f} M$/year")
+        print(f"Total variable operating cost (Cop,var): {total_variable_operating_cost:.4f} M$/year\n")
+        # print(f"Cost of brine disposal: {brine_disposal_cost:.4f} M$/year\n")
+
+
+        # Comparison with calculated values
+        total_fixed_operating_cost_cal = value(pyunits.convert(m.fs.zo_costing.aggregate_fixed_operating_cost + m.fs.zo_costing.maintenance_labor_chemical_operating_cost,
+                                                               to_units=pyunits.MUSD_2020 / pyunits.year))
+        total_variable_operating_cost_vop_cal = value(
+            pyunits.convert(m.fs.zo_costing.aggregate_variable_operating_cost,
+                            to_units=pyunits.MUSD_2020 / pyunits.year))
+        print("Used flows:")
+        for flow in m.fs.zo_costing.used_flows:
+           print(flow)
+        total_flow_cost_cal = value(
+            pyunits.convert(
+                sum(m.fs.zo_costing.aggregate_flow_costs[flow] for flow in m.fs.zo_costing.used_flows)
+                * m.fs.zo_costing.utilization_factor,
+                to_units=pyunits.MUSD_2020 / pyunits.year
+            )
+        )
+        total_operating_cost_cal = total_fixed_operating_cost_cal + total_variable_operating_cost_vop_cal + total_flow_cost_cal
+        total_variable_operating_cost_cal = total_variable_operating_cost_vop_cal + total_flow_cost_cal
+
+        print(f"(Calculated) Total Operating Cost (Cop,tot): {total_operating_cost_cal:.4f} M$/year")
+        print(f"(Calculated) Total fixed operating cost (Cop,fix): {total_fixed_operating_cost_cal:.4f} M$/year")
+        print(f"(Calculated) Total variable operating cost (Cop,var): {total_variable_operating_cost_cal:.4f} M$/year")
+        print(
+            f"(Calculated) Total variable operating cost from unit models (Cvop,u): {total_variable_operating_cost_vop_cal:.4f} M$/year")
+        print(f"(Calculated) Total flow cost (futil*Cflow,tot): {total_flow_cost_cal:.4f} M$/year")
+
+        print("\n----------Unit Operating Costs (only flow cost)----------")
+
+        flow_types = m.fs.zo_costing.used_flows
+        util = m.fs.zo_costing.utilization_factor
+        flow_cost_params = {
+            ft: getattr(m.fs.zo_costing, f"{ft}_cost") for ft in flow_types
+        }
+
+        unit_blocks = {name: block for name, block in m.fs.non_RO.component_map(Block).items() if
+                       isinstance(block, UnitModelBlockData)}
+
+        total_flow_cost = 0.0
+
+        for unit_name, unit_block in unit_blocks.items():
+            unit_total = 0.0
+            print(f"{unit_name}:")
+
+            for flow_type in flow_types:
+                if hasattr(unit_block, flow_type):
+                    var = getattr(unit_block, flow_type)
+                    if var.is_indexed():
+                        v = var[0]
+                    else:
+                        v = var
+                    cost = value(pyunits.convert(v * flow_cost_params[flow_type] * util,
+                                                 to_units=pyunits.USD_2020 / pyunits.year))
+                    print(f"  {flow_type} cost: {cost:,.2f} USD/year")
+                    unit_total += cost
+
+            print(f"  Total flow cost: {unit_total:,.2f} USD/year\n")
+            total_flow_cost += unit_total
+
+        print(f"Total flow cost across all units: {total_flow_cost:,.2f} USD/year")
+        print("---------------------------")
+
+        wrr = value(pyunits.convert(m.fs.water_recovery_revenue, to_units=pyunits.USD_2020 / pyunits.year))
+        _print_normalized_costs(m, capex, opex, wrr, "USD/year")
+
+        # print(f"LCOT_wo: {value(m.fs.LCOT_wo_revenue): .4f} ")
+        # m.fs.pprint()
+        # m.fs.zo_costing.pprint()
+
+
+    elif treatment_train in ("RBAT", "IPR"):
+        # Capex
+        print(f"\n----------System costing metrics (RO {'IPR' if treatment_train == 'IPR' else 'DPR'})----------\n")
+        capex = value(pyunits.convert(m.fs.total_capital_cost, to_units=pyunits.MUSD_2020))
+        print(f"Total Capital Cost: {capex:.4f} M$")
+        print(f"Base currency_ZO: {m.fs.zo_costing.base_currency}")
+        print(f"Base currency factor: {value(pyunits.convert(1 * pyunits.USD_2014, to_units=pyunits.USD_2020))}")
+
+        print(f"Total ZO Capital Cost: {value(pyunits.convert(m.fs.zo_costing.total_capital_cost, to_units=pyunits.MUSD_2020)):.4f} M$")
+        print(f"Total investment factor of ZO: {value(m.fs.zo_costing.total_investment_factor):.4f}")
+        print(f"Total RO Capital Cost: {value(pyunits.convert(m.fs.ro_costing.total_capital_cost, to_units=pyunits.MUSD_2020)):.4f} M$")
+        print(f"Total investment factor of RO: {value(m.fs.ro_costing.total_investment_factor):.4f}")
+        print(f"Base currency_RO: {m.fs.zo_costing.base_currency}")
+        print(f"Base currency factor (RO capital): {value(pyunits.convert(1 * pyunits.USD_2018, to_units=pyunits.USD_2020))}")
+
+        print("\n----------Unit Capital Costs----------")
+        total_unit_capex_cal = 0
+        for u in m.fs.zo_costing._registered_unit_costing:
+            unit_name = u.parent_block().local_name
+            print(
+                f"{unit_name} capital cost: {value(pyunits.convert(u.capital_cost*m.fs.zo_costing.total_investment_factor, to_units=pyunits.MUSD_2020)):.4f} M$")
+            total_unit_capex_cal += value(pyunits.convert(u.capital_cost*m.fs.zo_costing.total_investment_factor, to_units=pyunits.MUSD_2020))
+
+        for u in m.fs.ro_costing._registered_unit_costing:
+            unit_name = u.parent_block().local_name
+            print(
+                f"{unit_name} capital cost: {value(pyunits.convert(u.capital_cost*m.fs.ro_costing.total_investment_factor, to_units=pyunits.MUSD_2020)):.4f} M$")
+            total_unit_capex_cal += value(pyunits.convert(u.capital_cost*m.fs.ro_costing.total_investment_factor, to_units=pyunits.MUSD_2020))
+
+        print(f"(Calculated) Sum of capital costs of unit processes: {total_unit_capex_cal:.4f} M$")
+        print("---------------------------")
+
+        # Opex
+        opex = value(pyunits.convert(m.fs.total_operating_cost, to_units=pyunits.MUSD_2020 / pyunits.year))
+        total_fixed_operating_cost = (value(pyunits.convert(m.fs.zo_costing.total_fixed_operating_cost + m.fs.ro_costing.total_fixed_operating_cost,
+                                                            to_units=pyunits.MUSD_2020 / pyunits.year)) )
+        total_variable_operating_cost = (value(pyunits.convert(m.fs.zo_costing.total_variable_operating_cost + m.fs.ro_costing.total_variable_operating_cost,
+                                                               to_units=pyunits.MUSD_2020 / pyunits.year)) )
+
+        ro_opex = value(
+            pyunits.convert(m.fs.ro_costing.total_operating_cost, to_units=pyunits.MUSD_2020 / pyunits.year))
+
+        brine_disposal_cost = value(pyunits.convert(m.fs.brine_disposal_cost,
+                                                    to_units=pyunits.MUSD_2020 / pyunits.year))
+        print(f"\nTotal Operating Cost (Cop,tot): {opex:.4f} M$/year")
+        print(f"\nOperating Cost of RO: {ro_opex:.4f} M$/year")
+        print(f"Total fixed operating cost (Cop,fix): {total_fixed_operating_cost:.4f} M$/year")
+        print(f"Total variable operating cost (Cop,var): {total_variable_operating_cost:.4f} M$/year\n")
+        print(f"Cost of brine disposal: {brine_disposal_cost:.4f} M$/year\n")
+
+        # Comparison with calculated values
+        total_fixed_operating_cost_cal = value(pyunits.convert(m.fs.zo_costing.aggregate_fixed_operating_cost + m.fs.zo_costing.maintenance_labor_chemical_operating_cost
+                                                               + m.fs.ro_costing.aggregate_fixed_operating_cost + m.fs.ro_costing.maintenance_labor_chemical_operating_cost,
+                                                                to_units=pyunits.MUSD_2020 / pyunits.year))
+
+        total_variable_operating_cost_vop_cal = value(
+            pyunits.convert(m.fs.zo_costing.aggregate_variable_operating_cost + m.fs.ro_costing.aggregate_variable_operating_cost,
+                            to_units=pyunits.MUSD_2020 / pyunits.year))
+
+        print("Used flows in non-RO:")
+        for flow in m.fs.zo_costing.used_flows:
+            print(flow)
+        print("\nUsed flows in RO:")
+        for flow in m.fs.ro_costing.used_flows:
+            print(flow)
+
+        total_flow_cost_cal = value(
+            pyunits.convert(
+                (sum(m.fs.zo_costing.aggregate_flow_costs[flow] for flow in m.fs.zo_costing.used_flows)
+                 + sum(m.fs.ro_costing.aggregate_flow_costs[flow] for flow in m.fs.ro_costing.used_flows))
+                * m.fs.zo_costing.utilization_factor,
+                to_units=pyunits.MUSD_2020 / pyunits.year
+            )
+        )
+        total_operating_cost_cal = total_fixed_operating_cost_cal + total_variable_operating_cost_vop_cal + total_flow_cost_cal
+        total_variable_operating_cost_cal = total_variable_operating_cost_vop_cal + total_flow_cost_cal
+
+        print(f"(Calculated) Total Operating Cost (Cop,tot): {total_operating_cost_cal:.4f} M$/year")
+        print(f"(Calculated) Total fixed operating cost (Cop,fix): {total_fixed_operating_cost_cal:.4f} M$/year")
+        print(f"(Calculated) Total variable operating cost (Cop,var): {total_variable_operating_cost_cal:.4f} M$/year")
+        print(
+            f"(Calculated) Total variable operating cost from unit models (Cvop,u): {total_variable_operating_cost_vop_cal:.4f} M$/year")
+        print(f"(Calculated) Total flow cost (futil*Cflow,tot): {total_flow_cost_cal:.4f} M$/year")
+
+
+        print("\n----------Unit Operating Costs (only flow cost)----------")
+        flow_types_zo = list(m.fs.zo_costing.used_flows)
+        util_zo = m.fs.zo_costing.utilization_factor
+        flow_cost_zo = {ft: getattr(m.fs.zo_costing, f"{ft}_cost") for ft in flow_types_zo}
+
+        unit_blocks_non_RO = {
+            f"non_RO.{name}": blk for name, blk in m.fs.non_RO.component_map(Block).items()
+            if isinstance(blk, UnitModelBlockData)
+        }
+
+        total_flow_cost_non_RO = 0.0
+        for unit_name, unit_block in unit_blocks_non_RO.items():
+            unit_total = 0.0
+            print(f"{unit_name}:")
+            for ft in flow_types_zo:
+                if hasattr(unit_block, ft):
+                    var = getattr(unit_block, ft)
+                    v = var[0] if var.is_indexed() else var
+                    cost = value(pyunits.convert(v * flow_cost_zo[ft] * util_zo,
+                                                 to_units=pyunits.USD_2020 / pyunits.year))
+                    print(f"  {ft} cost: {cost:,.2f} USD/year")
+                    unit_total += cost
+            print(f"  Total flow cost: {unit_total:,.2f} USD/year\n")
+            total_flow_cost_non_RO += unit_total
+        print(f"Total flow cost across non_RO units: {total_flow_cost_non_RO:,.2f} USD/year")
+
+        # ---------- RO_main (RO costing: electricity via work) ----------
+        # flow_types_ro = list(m.fs.ro_costing.used_flows)
+        # util_ro = m.fs.ro_costing.utilization_factor
+        # flow_cost_ro = {ft: getattr(m.fs.ro_costing, f"{ft}_cost") for ft in flow_types_ro}
+        #
+        # unit_blocks_RO = {
+        #     f"RO.{name}": blk for name, blk in m.fs.RO_main.component_map(Block).items()
+        #     if isinstance(blk, UnitModelBlockData)
+        # }
+        #
+        # total_flow_cost_RO = 0.0
+        # for unit_name, unit_block in unit_blocks_RO.items():
+        #     unit_total = 0.0
+        #     print(f"{unit_name}:")
+        #     for ft in flow_types_ro:
+        #         if hasattr(unit_block, ft):
+        #             var = getattr(unit_block, ft)
+        #             v = var[0] if var.is_indexed() else var
+        #             cost = value(pyunits.convert(v * flow_cost_ro[ft] * util_ro,
+        #                                          to_units=pyunits.USD_2020 / pyunits.year))
+        #             print(f"  {ft} cost: {cost:,.2f} USD/year")
+        #             unit_total += cost
+        #     print(f"  Total flow cost: {unit_total:,.2f} USD/year\n")
+        #     total_flow_cost_RO += unit_total
+        # print(f"Total flow cost across RO_main units: {total_flow_cost_RO:,.2f} USD/year")
+        # print("---------------------------")
+        #
+        # total_flow=total_flow_cost_non_RO+total_flow_cost_RO
+        # print(f"Total flow cost: {total_flow:,.2f} USD/year")
+        # print("---------------------------")
+
+        t0 = m.fs.time.first()
+        util_ro = m.fs.ro_costing.utilization_factor
+        elec_price_ro = m.fs.ro_costing.electricity_cost
+        hours_per_year = 8766 * pyunits.h / pyunits.a
+
+        # Collect RO_main unit data objects: the scalar units (pump, ERD) plus every indexed
+        # RO stage (RO[i]). component_map(Block) returns the indexed RO as a single container
+        # that is NOT itself a UnitModelBlockData, so iterate its members to itemize each stage
+        # (otherwise the stages -- and, below, the membrane-replacement cost -- are dropped).
+        unit_blocks_ro_main = {}
+        for name, comp in m.fs.RO_main.component_map(Block).items():
+            if isinstance(comp, UnitModelBlockData):
+                unit_blocks_ro_main[f"RO_main.{name}"] = comp
+            else:
+                for idx in comp:
+                    data = comp[idx]
+                    if isinstance(data, UnitModelBlockData):
+                        unit_blocks_ro_main[f"RO_main.{name}[{idx}]"] = data
+
+        print("\n----------Unit Operating Costs (electricity + membrane replacement) [RO_main / RO]----------")
+        total_flow_cost_ro_main = 0.0
+        for unit_name, unit_block in unit_blocks_ro_main.items():
+            print(f"{unit_name}:")
+            unit_total = 0.0
+
+            # Electricity from mechanical work (pump & ERD carry work; RO stages have none)
+            if hasattr(unit_block, "control_volume") and hasattr(unit_block.control_volume, "work"):
+                power_kW = pyunits.convert(unit_block.control_volume.work[t0], to_units=pyunits.kW)
+                annual_kWh = power_kW * hours_per_year
+                elec_cost = value(pyunits.convert(annual_kWh * elec_price_ro * util_ro,
+                                                  to_units=pyunits.USD_2020 / pyunits.year))
+                print(f"  electricity cost: {elec_cost:,.2f} USD/year")
+                unit_total += elec_cost
+                total_flow_cost_ro_main += elec_cost
+            else:
+                print("  (no control_volume.work; electricity cost assumed 0)")
+
+            print(f"  Total flow cost: {unit_total:,.2f} USD/year\n")
+
+        # Membrane replacement is a single system aggregate (it scales with the TOTAL membrane
+        # area summed over all stages), so report it once for the RO array rather than per stage.
+        memrep_cost = value(pyunits.convert(
+            m.fs.ro_costing.aggregate_flow_costs["membrane_replacement"] * util_ro,
+            to_units=pyunits.USD_2020 / pyunits.year
+        ))
+        print(f"RO array (all stages): membrane_replacement cost: {memrep_cost:,.2f} USD/year\n")
+        total_flow_cost_ro_main += memrep_cost
+
+        print(f"Total flow cost across RO_main units: {total_flow_cost_ro_main:,.2f} USD/year")
+        print("---------------------------")
+
+        total_flow=total_flow_cost_non_RO+total_flow_cost_ro_main
+        print(f"Total flow cost: {total_flow:,.2f} USD/year")
+        print("---------------------------")
+
+
+        wrr = value(pyunits.convert(m.fs.water_recovery_revenue, to_units=pyunits.MUSD_2020 / pyunits.year))
+        _print_normalized_costs(m, capex, opex, wrr, "M$/year")
+        # m.fs.RO_main.pprint()
+        # m.fs.RO_main.pump.pprint()
+
+        # m.fs.ro_costing.pprint()
+
+if __name__ == "__main__":
+    m, results = main()
+    # m.fs.RO_main.RO.report()
+    # m.fs.RO_main.pump.pprint()
+    # m.fs.tb_pre_main.pprint()
+    # m.fs.tb_main_post.pprint()
