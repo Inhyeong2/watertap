@@ -81,7 +81,9 @@ def _capex_ratio(m, train):
     ann_capex = value(pyunits.convert(
         m.fs.total_capital_cost * m.fs.zo_costing.capital_recovery_factor, to_units=yr))
     opex = value(pyunits.convert(m.fs.total_operating_cost, to_units=yr))
-    if train == "RBAT":
+    if train in ("RBAT", "IPR"):
+        # RBAT and IPR both build m.fs.brine_disposal_cost as an externality (RO array + ERD +
+        # brine product), so brine disposal must be added to opex for both.
         opex += value(pyunits.convert(m.fs.brine_disposal_cost, to_units=yr))
     return ann_capex / (ann_capex + opex)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -193,6 +195,100 @@ def run_rbat_opt_vs_conserv(states=RBAT_STATES):
                          f"{ycol} vs system capacity  (label = SYSTEM recovery; per-stage in parens)")
             ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
             png = os.path.join(OVC_DIR, f"optimal_vs_conserv_{state}{tag}.png")
+            fig.savefig(png, dpi=150); plt.close(fig)
+            print("saved:", png)
+        print("saved:", csv)
+
+
+# ===========================================================================
+# Part 1b -- Optimized vs Conservative, IPR (recovery-stepped)
+# ===========================================================================
+# IPR (UF->RO->UV/AOP, CA / SECONDARY). Same recovery-stepped conservative idea as RBAT: for each
+# fixed per-stage RO recovery the SYSTEM recovery is 1-(1-rec)^n. The ONLY conservative knobs IPR
+# has are the RO per-stage recovery and the UV/AOP H2O2 dose -- there is no ozone/BAF/final-Cl to
+# over-dose (those units are absent from the IPR train). The recovery set matches RBAT so the two
+# opt-vs-conserv figures are directly comparable. CA only (IPR is CA-regulation-supported).
+IPR_OVC_CASES = [("Optimized", None), ("Conserv rec=0.40", 0.40), ("Conserv rec=0.35", 0.35),
+                 ("Conserv rec=0.30", 0.30), ("Conserv rec=0.25", 0.25), ("Conserv rec=0.20", 0.20)]
+IPR_OVC_STATES = ["CA"]
+
+
+def _ipr_point(flow_mgd, recovery, state):
+    LRV, det, st, tt, eff, sol = dpr.DPR_initial_setting(
+        state=state, treatment_train="IPR", effluent_type="SECONDARY")
+    m = dpr.build_RO(solute_list=sol, state=st, effluent_type=eff, treatment_train=tt,
+                     n_stages=N_STAGES)
+    dpr.set_operating_conditions(m, solute_list=sol, treatment_train=tt)
+    m.fs.feed.flow_vol[0].fix(flow_mgd * MGD)
+    dpr.solve(m.fs.feed)
+    dpr.scale_system(m, treatment_train=tt)
+    dpr.initialize_system(m, treatment_train=tt)
+    dpr.solve(m)
+    dpr.add_costing(m, treatment_train=tt)
+    dpr.initialize_costing(m, treatment_train=tt)
+    dpr.optimize_operation(m, state=st, effluent_type=eff, treatment_train=tt)
+    nonRO = m.fs.non_RO
+    res = dpr.solve(m)  # optimized solution (also warm start for the conservative re-solve)
+    if recovery is not None:
+        # Conservative: over-dose UV/AOP H2O2 (max of its 2-10 mg/L range) + fix RO per-stage
+        # recovery. IPR has no ozone/BAF/Cl2 to over-dose.
+        nonRO.UV_AOP.hydrogen_peroxide_dose[0].fix(10)
+        fix_conservative_recovery(m, recovery)
+        res = dpr.solve(m)
+    # System average flux [LMH] = total blended permeate / total membrane area.
+    Ja = ro_permeate_flow(m) / ro_total_area(m) * 3.6e6
+    cr = _capex_ratio(m, "IPR")
+    return check_optimal_termination(res), value(m.fs.LCOW), ro_sys_recovery(m), Ja, cr
+
+
+def _ipr_rescue(flow_mgd, recovery, state):
+    last = None
+    for eps in PERTURB:
+        try:
+            ok, lcow, rec, flux, cr = _ipr_point(flow_mgd * (1 + eps), recovery, state)
+            if ok:
+                return lcow, rec, flux, cr
+            last = (lcow, rec, flux, cr)
+        except Exception:
+            last = None
+    return (float("nan"),) * 4 if last is None else (float("nan"), last[1], last[2], last[3])
+
+
+def run_ipr_opt_vs_conserv(states=IPR_OVC_STATES):
+    os.makedirs(OVC_DIR, exist_ok=True)
+    for state in states:
+        print(f"\n========== IPR opt-vs-conserv: {state} ==========")
+        rows = []
+        csv = os.path.join(OVC_DIR, f"optimal_vs_conserv_IPR_{state}.csv")
+        for label, rec in IPR_OVC_CASES:
+            for f in FLOWS_MGD:
+                lcow, r, flux, cr = _ipr_rescue(f, rec, state)
+                rows.append({"state": state, "case": label, "recovery_target": rec,
+                             "flow_MGD": f, "LCOW": lcow, "recovery": r, "flux_LMH": flux,
+                             "capex_ratio": cr})
+                print(f"[{state}][{label:18s}] {f:4d} MGD -> LCOW={lcow:.4f} recov={r:.3f} "
+                      f"flux={flux:.1f} capexR={cr:.3f}")
+                pd.DataFrame(rows).to_csv(csv, index=False)
+        df = pd.DataFrame(rows)
+        for ycol, ylab, tag in [("LCOW", "LCOW ($/m$^3$)", ""),
+                                ("capex_ratio", "CAPEX ratio [ann.CAPEX/(ann.CAPEX+OPEX)]", "_capexratio")]:
+            fig, ax = plt.subplots(figsize=(8.5, 6))
+            for label, rec in IPR_OVC_CASES:
+                d = df[df["case"] == label].dropna(subset=[ycol]).sort_values("flow_MGD")
+                if d.empty:
+                    # A conservative per-stage recovery that does not converge for this n_stages
+                    # (e.g. a high uniform recovery is infeasible for the concentrated back stage
+                    # of a 3-stage cascade) is simply omitted.
+                    continue
+                sysrec = df[df["case"] == label]["recovery"].mean() * 100
+                leg = (f"Optimized (sys recovery ~{sysrec:.0f}%)" if rec is None
+                       else f"Conservative: sys recovery {sysrec:.0f}% (per-stage {rec*100:.0f}%)")
+                ax.plot(d["flow_MGD"], d[ycol], marker="o", label=leg)
+            ax.set_xlabel("System capacity (MGD)"); ax.set_ylabel(ylab)
+            ax.set_title(f"IPR ({state}, {N_STAGES}-stage): Optimized vs Conservative\n"
+                         f"{ycol} vs system capacity  (label = SYSTEM recovery; per-stage in parens)")
+            ax.grid(True, alpha=0.3); ax.legend(); fig.tight_layout()
+            png = os.path.join(OVC_DIR, f"optimal_vs_conserv_IPR_{state}{tag}.png")
             fig.savefig(png, dpi=150); plt.close(fig)
             print("saved:", png)
         print("saved:", csv)

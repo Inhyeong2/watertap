@@ -126,9 +126,27 @@ def run_ipr(stages, num_samples):
         print(f"[IPR {n}-stage] repaired {nfix} outlier(s); wrote {os.path.basename(csv)}",
               flush=True)
 
+        # Optimal vs Conservative (LCOW + CAPEX ratio figures), IPR / CA.
+        print(f"[IPR {n}-stage] Optimal vs Conservative ...", flush=True)
+        ana.run_ipr_opt_vs_conserv(states=(IPR_STATE,))
+
     # Final figures: single-color (sky-blue) scatter + worst/best envelope, shared y-axis.
     replot_ipr_envelopes(stages, num_samples)
     print("\n>>> IPR DONE", flush=True)
+
+
+def run_ipr_ovc(stages):
+    """IPR Optimal-vs-Conservative only (no Monte Carlo), stage-tagged, CA / SECONDARY.
+
+    Use this to add OVC figures for stage counts whose Monte Carlo scatter already exists,
+    without re-running the (expensive) 1000-sample sweep. Output (per stage count):
+      output/optimal_vs_conserv_n<N>/optimal_vs_conserv_IPR_CA.csv / .png (+ _capexratio.png)
+    """
+    for n in stages:
+        _configure_stage(n)
+        print(f"\n################  IPR OVC  N_STAGES = {n}  ################", flush=True)
+        ana.run_ipr_opt_vs_conserv(states=(IPR_STATE,))
+    print("\n>>> IPR OVC DONE", flush=True)
 
 
 def replot_ipr_envelopes(stages, num_samples):
@@ -186,6 +204,10 @@ if __name__ == "__main__":
         run_ipr(stages=[2], num_samples=12)        # fast IPR end-to-end check
     elif mode == "ipr":
         run_ipr(stages=[2, 3], num_samples=1000)   # IPR full run (CA / SECONDARY)
+    elif mode == "ipr-ovc-smoke":
+        run_ipr_ovc(stages=[1])                    # fast IPR OVC check (n=1)
+    elif mode == "ipr-ovc":
+        run_ipr_ovc(stages=[1, 2, 3])              # IPR OVC only (MC already run), CA / SECONDARY
     elif mode == "ipr-replot":
         # Re-draw IPR figures (sky-blue scatter + envelope, shared axis) from existing CSVs.
         replot_ipr_envelopes(stages=[2, 3], num_samples=1000)
