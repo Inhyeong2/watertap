@@ -518,6 +518,21 @@ def _env_curve(state, train, mode):
                           f"{c:.4f} -> {new:.4f} (was >{int(ENV_SMOOTH_TOL*100)}% above neighbors)")
                     ys[i] = new
                     changed = True
+        # Endpoint (last flow) repair: the interior test above needs BOTH neighbors, so the
+        # last point is never checked -- yet an economy-of-scale envelope is monotone
+        # decreasing, so a last point sitting ABOVE its left neighbor is a non-convex
+        # local-optimum spike (e.g. the IPR n=2 100 MGD best-case bump). Multi-start it and
+        # keep the lower LCOW. (No analogous test for the FIRST point: a high low-capacity
+        # start is indistinguishable from a genuinely steep true curve.)
+        i = len(ys) - 1
+        if i >= 1 and not np.isnan(ys[i]) and not np.isnan(ys[i - 1]) \
+                and ys[i] > ys[i - 1] * (1 + ENV_SMOOTH_TOL):
+            new = _env_lcow_multistart(state, train, fx[i], mode)
+            if not np.isnan(new) and new < ys[i] - 1e-9:
+                print(f"  [repair {train} {state} {mode}] {int(fx[i]):4d} MGD: "
+                      f"{ys[i]:.4f} -> {new:.4f} (last point above neighbor; monotone-envelope artifact)")
+                ys[i] = new
+                changed = True
         if not changed:
             break
     return ys
