@@ -164,8 +164,8 @@ def set_operating_conditions(
     m.fs.costing.reverse_osmosis.factor_membrane_replacement.fix(0.2 * m.fs.costing.utilization_factor.value) # utilization factor should be considered
                                                                                                              # because it is not considered for fixed_operating_cost
                                                                                                              # but considered for flow_cost
-    m.fs.pump.costing.costing_package.high_pressure_pump.cost.fix(53 / 1e5 * 3600 *m.fs.costing.total_investment_factor.value)
-    m.fs.ERD.costing.costing_package.energy_recovery_device.pressure_exchanger_cost.fix(535 * m.fs.costing.total_investment_factor.value)
+    m.fs.pump.costing.costing_package.high_pressure_pump.unit_cost.fix(53 / 1e5 * 3600 *m.fs.costing.total_investment_factor.value)
+    m.fs.ERD.costing.costing_package.energy_recovery_device.unit_cost.fix(535 * m.fs.costing.total_investment_factor.value)
 
     # m.fs.RO.costing.del_component(m.fs.RO.costing.capital_cost_constraint)
     # m.fs.RO.costing.capital_cost_constraint = pyo.Constraint(
