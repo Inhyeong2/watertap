@@ -77,7 +77,7 @@ from watertap.core.zero_order_properties import WaterParameterBlock
 from watertap.core.wt_database import Database
 from watertap.unit_models.zero_order import (
     FeedZO,
-    OzoneDPRZO,
+    OzoneDPRZOv0,
     BioActiveFiltrationDPRZO,
     UltraFiltrationDPRZO,
     GACDPRZO,
@@ -405,7 +405,7 @@ def build_nonRO(working_directory="module", state=None, solute_list=None, efflue
 
     # define flowsheet inlets and outlets
     m.fs.feed = FeedZO(property_package=m.fs.prop_zo)
-    non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
+    non_RO.Ozone = OzoneDPRZOv0(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
                               LRVO3_required=LRVO3_req)
     non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
     non_RO.UF = UltraFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db)
@@ -479,7 +479,7 @@ def build_RO(working_directory="module", state=None, solute_list=None, effluent_
     # a design assumption to be verified against the current regulation before citing it.
     is_ipr = (treatment_train == "IPR")
     if not is_ipr:
-        non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
+        non_RO.Ozone = OzoneDPRZOv0(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
                                   LRVO3_required=LRVO3_req)
         non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
         m.fs.byproduct_BAF = Product(property_package=m.fs.prop_zo)
@@ -2515,6 +2515,6 @@ def display_cost(m, treatment_train=None):
 if __name__ == "__main__":
     m, results = main()
     # m.fs.RO_main.RO.report()
-    # m.fs.RO_main.pump.pprint()
+    # m.fs.RO_main.pprint()
     # m.fs.tb_pre_main.pprint()
     # m.fs.tb_main_post.pprint()

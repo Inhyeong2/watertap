@@ -80,6 +80,7 @@ from .surface_discharge_zo import SurfaceDischargeZO
 from .electrocoagulation_zo import ElectrocoagulationZO
 
 from .ozone_DPR_zo import OzoneDPRZO
+from .ozone_DPR_zo_v0 import OzoneDPRZOv0
 from .bio_active_filtration_DPR_zo import BioActiveFiltrationDPRZO
 from .ultra_filtration_DPR_zo import UltraFiltrationDPRZO
 from .chlorination_DPR_zo import ChlorinationDPRZO

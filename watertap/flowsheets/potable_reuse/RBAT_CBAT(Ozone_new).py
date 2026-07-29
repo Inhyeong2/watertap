@@ -58,7 +58,7 @@ from watertap.core.zero_order_properties import WaterParameterBlock
 from watertap.core.wt_database import Database
 from watertap.unit_models.zero_order import (
     FeedZO,
-    OzoneDPRZO,
+    OzoneDPRZOv0,
     BioActiveFiltrationZO,
     UltraFiltrationZO,
     GACZO,
@@ -184,7 +184,7 @@ def build_nonRO(working_directory=None):
     m.fs.feed = FeedZO(property_package=m.fs.prop_zo)
 
     # non-RO DPR components
-    non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, effluent_type="Tertiary", LRVO3_required=1.0)
+    non_RO.Ozone = OzoneDPRZOv0(property_package=m.fs.prop_zo, database=m.db, effluent_type="Tertiary", LRVO3_required=1.0)
     # nitrite should be considered
 
 
@@ -251,7 +251,7 @@ def build_nonRO(working_directory=None):
 #     m.fs.treated_RO = Product(property_package=m.fs.prop_zo)
 # #
 #     # RO DPR components
-#     RO_pre.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db)
+#     RO_pre.Ozone = OzoneDPRZOv0(property_package=m.fs.prop_zo, database=m.db)
 #     # RO_pre.UF = UltraFiltrationZO(property_package=m.fs.prop_zo, database=m.db)
 # #     m.fs.byproduct_UF = Product(property_package=m.fs.prop_zo)
 # #
