@@ -22,16 +22,18 @@ derived CT relationship:
     exp_t   = exp(-k * (HRT - 0.5 min))
     C_30s   = CTreq * k / (0.5*k + (1 - exp_t))            residual after 30 s
     expr1   = (C_30s - 1.136) / 0.704                      O3:TOC to meet CT
-    expr2   = (0.2/exp_t - 1.136) / 0.704                  O3:TOC to hold 0.2 mg/L residual (CO)
-    O3:TOC  = max(expr1, [expr2], floor)
+    O3:TOC  = max(expr1, floor)
 
 Because ``kO3`` is a function of the O3:TOC ratio and of the effluent type, both
 secondary and tertiary effluent are handled by the same equation (no per-effluent
 polynomial refit). Both the contact time (HRT) and O3:TOC are left as free
 variables linked by this single equality, so the flowsheet optimizer trades HRT
-against O3:TOC along the CT curve. Regulatory floors: California uses a floor of
-1.0 on O3:TOC (most stringent), Colorado additionally enforces a 0.2 mg/L ozone
-residual (expr2); all others use a 0.5 floor.
+against O3:TOC along the CT curve. Regulatory floors: California pins O3:TOC at 1.0
+(most stringent) and lets the HRT carry the CT; all other states use a 0.5 floor.
+
+A Colorado 0.2 mg/L ozone-residual term (expr2) is present but commented out in
+O3toTOC_ratio_constraint: that residual requirement does not apply to ozone under
+the CO regulation. Re-enable it there to restore the residual-based floor for CO.
 """
 
 import pyomo.environ as pyo
@@ -208,17 +210,19 @@ class OzoneDPRZOData(ZeroOrderBaseData):
 
             if state == "CA":
                 # California mandates O3:TOC = 1.0 exactly (most stringent design).
-                # The Cryptosporidium CT is then met by driving the HRT up; that CT
-                # inequality is added in the flowsheet at the optimization stage
-                # (see _add_ozone_ct_constraint) so the square initialization solve
-                # -- where contact_time is fixed -- is not made infeasible.
+                # With the dose pinned, the Cryptosporidium CT is carried by the HRT,
+                # which is determined in-model by ca_hrt_ct_constraint (see below).
                 return b.O3toTOC[t] == 1.0
             elif state == "CO":
-                # Colorado additionally requires a >= 0.2 mg/L ozone residual.
-                expr2 = (0.2 * (pyunits.mg / pyunits.L) / exp_term - 1.136 * pyunits.mg / pyunits.L) / (
-                    0.704 * pyunits.mg / pyunits.L
-                )
-                return b.O3toTOC[t] == smooth_max(smooth_max(expr1, expr2), 0.5)
+                # NOTE (2026-07): the 0.2 mg/L ozone-residual requirement does NOT apply
+                # to ozone under the Colorado regulation, so the residual term (expr2) is
+                # disabled and CO is treated like the other non-CA states (CT + 0.5 floor).
+                # Re-enable the two commented lines below to restore the residual term.
+                # expr2 = (0.2 * (pyunits.mg / pyunits.L) / exp_term - 1.136 * pyunits.mg / pyunits.L) / (
+                #     0.704 * pyunits.mg / pyunits.L
+                # )
+                # return b.O3toTOC[t] == smooth_max(smooth_max(expr1, expr2), 0.5)
+                return b.O3toTOC[t] == smooth_max(expr1, 0.5)
             else:
                 return b.O3toTOC[t] == smooth_max(expr1, 0.5)
 
