@@ -63,7 +63,7 @@ class GACDPRZOData(ZeroOrderBaseData):
         self.replacement_frequency = pyo.Expression(
             self.flowsheet().time,
             rule=lambda b, t: pyunits.convert(((b.required_BV[t] * b.EBCT[t] * pyunits.day) / (
-                1450 * pyunits.minute)), to_units=pyunits.year),
+                1440 * pyunits.minute)), to_units=pyunits.year),
             doc="replacement_frequency",
         )
 
