@@ -1099,6 +1099,7 @@ def initialize_system(m, treatment_train = None):
         non_RO.Ozone.initialize()
         propagate_state(non_RO.s01)
 
+        _sync_baf_toc_removal(non_RO)
         non_RO.BAF.initialize()
         propagate_state(non_RO.s02)
 
@@ -1126,6 +1127,7 @@ def initialize_system(m, treatment_train = None):
             non_RO.Ozone.initialize()
             propagate_state(non_RO.s01)
 
+            _sync_baf_toc_removal(non_RO)
             non_RO.BAF.initialize()
             propagate_state(non_RO.s02)
 
@@ -1197,20 +1199,107 @@ def _setup_ozone_optimization(non_RO, state):
         non_RO.Ozone.O3toTOC[0].setlb(0.5)
         non_RO.Ozone.O3toTOC[0].setub(1)
 
+def _baf_toc_removal_expr(non_RO, t):
+    """BAF TOC removal correlation: a coded factorial regression in the upstream
+    ozone dose and the BAF contact time. Single source of truth for the correlation
+    -- both the optimization constraint and the initialization sync use it."""
+    x1 = (non_RO.Ozone.O3toTOC[t] - 0.48) / 0.44
+    x2 = (non_RO.BAF.EBCT[t] / pyunits.minute - 14.4) / 8.5
+    return (21.9 + 5.3 * x1 + 3.9 * x2 + 1.4 * x1 * x2) / 100
+
 def _add_baf_toc_removal_constraint(m, non_RO):
     # Constraint: removal fraction expression for toc for BAF
     if hasattr(non_RO, "link_removal_frac_toc"):
         non_RO.del_component("link_removal_frac_toc")
     non_RO.link_removal_frac_toc = Constraint(
         m.fs.time,
-        rule=lambda b, t: non_RO.BAF.removal_frac_mass_comp[t, "toc"] ==
-                          (21.9
-                           + 5.3 * (non_RO.Ozone.O3toTOC[t] - 0.48) / 0.44
-                           + 3.9 * (non_RO.BAF.EBCT[t] / pyunits.minute - 14.4) / 8.5
-                           + 1.4 * (non_RO.Ozone.O3toTOC[t] - 0.48) / 0.44 * (
-                                       non_RO.BAF.EBCT[t] / pyunits.minute - 14.4) / 8.5
-                           ) / 100
+        rule=lambda b, t: non_RO.BAF.removal_frac_mass_comp[t, "toc"]
+                          == _baf_toc_removal_expr(non_RO, t),
     )
+
+def _sync_baf_toc_removal(non_RO):
+    """Set the BAF TOC removal to the value its own correlation gives.
+
+    load_parameters_from_database fixes removal_frac[toc] at the database default
+    (0.2), but optimize_operation later imposes link_removal_frac_toc, whose range
+    over the EBCT / O3:TOC bounds starts at ~0.25 -- so the square initialization
+    solve converges to a point the optimization immediately has to leave, and the
+    reported pre-optimization state is not a state the correlation admits.
+
+    Call this once the ozone unit is initialized: O3:TOC is then converged (it is
+    set by O3toTOC_ratio_constraint from the HRT and the required LRV, independent
+    of the stream, so it does not move in the subsequent flowsheet solve) and the
+    correlation can be evaluated.
+
+    Sets the value WITHOUT touching the fixed flag. During initialization the
+    variable is already fixed (load_parameters_from_database), so this just moves
+    the fixed value and the square solve stays square. After optimize_operation it
+    is a free decision variable, and initialize_system may legitimately be re-run on
+    an already-optimized model (the recovery path when a sweep step fails to solve);
+    calling .fix() there would steal a degree of freedom and let
+    link_removal_frac_toc back-solve EBCT from the re-fixed removal, freezing EBCT at
+    whatever the failed solve left behind -- a spurious "optimum" ~1 % off the true
+    one, reported as optimal.
+    """
+    for t in non_RO.BAF.flowsheet().time:
+        non_RO.BAF.removal_frac_mass_comp[t, "toc"].set_value(
+            value(_baf_toc_removal_expr(non_RO, t))
+        )
+
+def _fix_toc_effluent_limit(non_RO, state):
+    """Create (once) and fix the finished-water TOC limit. Returns the Var (mg/L).
+
+    CA caps product TOC at 0.5 mg/L; the other states apply a 2 mg/L limit. The
+    hasattr guard makes optimize_operation re-callable on an already-optimized
+    model (the sweep re-optimizes in place) without implicitly replacing the Var.
+    """
+    if not hasattr(non_RO, "toc_eff"):
+        non_RO.toc_eff = Var(
+            units=pyunits.mg / pyunits.L,
+            initialize=1,
+            bounds=(0, 2),
+            doc="TOC effluent limit",
+        )
+    non_RO.toc_eff.fix(0.5 if state == "CA" else 2)
+    return non_RO.toc_eff
+
+def _add_product_toc_limit(m, non_RO, state, product):
+    """Regulatory TOC limit on the finished water, as an inequality. RO trains only.
+
+    CBAT states this spec through total_toc_removal (an inequality on the BAF/GAC
+    removal pair, since those are the only units that remove TOC there). The RO
+    trains have no such constraint: TOC bypasses the RO model entirely (prop_ro
+    carries only H2O/TDS) and is reapplied algebraically at tb_main_post with a
+    fixed 99 % rejection, so compliance was implicit rather than enforced.
+
+    This inequality makes it explicit. At the design point it is slack by a wide
+    margin (~0.07 mg/L product TOC against a 0.5 mg/L CA limit -- the feed would
+    have to exceed ~70 mg/L TOC to bind), so it does not change the optimum; it
+    guards the extremes of a feed-TOC sweep and documents the spec in the model.
+
+    Stated on the TOC MASS FLOW (flow_mass_toc <= limit * flow_vol) rather than on the
+    concentration. The two are equivalent, but conc_mass_comp is flow_mass_toc / sum(
+    flow_mass) * dens -- a ratio, whose row carries Jacobian entries spanning ~6 orders
+    of magnitude. Multiplying through by flow_vol leaves a row that is linear in the mass
+    flows; it is then scaled to O(1), since the mass flows are O(1e-3) kg/s.
+    """
+    toc_eff = _fix_toc_effluent_limit(non_RO, state)
+
+    if hasattr(non_RO, "product_toc_limit"):
+        non_RO.del_component("product_toc_limit")
+    non_RO.product_toc_limit = Constraint(
+        m.fs.time,
+        rule=lambda b, t: product.properties[t].flow_mass_comp["toc"]
+                          <= pyunits.convert(
+                              toc_eff * product.properties[t].flow_vol,
+                              to_units=pyunits.kg / pyunits.s,
+                          ),
+    )
+    for t in m.fs.time:
+        nominal = value(pyunits.convert(
+            toc_eff * product.properties[t].flow_vol, to_units=pyunits.kg / pyunits.s))
+        if nominal > 0:
+            iscale.constraint_scaling_transform(non_RO.product_toc_limit[t], 1 / nominal)
 
 def optimize_operation(m, state = None, effluent_type = None, treatment_train = None):
     if treatment_train == "CBAT": #non-RO
@@ -1254,27 +1343,38 @@ def optimize_operation(m, state = None, effluent_type = None, treatment_train = 
 
         _add_baf_toc_removal_constraint(m, non_RO)
 
-        non_RO.toc_eff = Var(
-            units=pyunits.mg / pyunits.L,
-            initialize=1,
-            bounds=(0, 2),
-            doc="TOC effluent limit",
+        toc_eff = pyunits.convert(
+            _fix_toc_effluent_limit(non_RO, state), to_units=pyunits.kg / pyunits.m ** 3
         )
 
-        if state == "CA":
-            non_RO.toc_eff.fix(0.5)
-            toc_eff = pyunits.convert(non_RO.toc_eff, to_units=pyunits.kg / pyunits.m ** 3)
-        else:
-            non_RO.toc_eff.fix(2)
-            toc_eff = pyunits.convert(non_RO.toc_eff, to_units=pyunits.kg / pyunits.m ** 3)
-
-        # Constraint: TOC removal for the entire treatment train
+        # Constraint: TOC removal for the entire treatment train.
+        #
+        # Inequality, not equality: an equality forces the product to sit EXACTLY on the
+        # limit, which is unsatisfiable whenever the train cannot help but do better than
+        # the limit. BAF removal is pinned by link_removal_frac_toc, GAC removal is floored
+        # at 0.43 and its required_BV is capped at 24675, so below a feed TOC of ~5 mg/L
+        # the equality has no solution and the solve fails on compliant water. As <=, that
+        # case simply leaves the constraint slack against those bounds.
+        #
+        # The optimum is unchanged wherever the equality was feasible: cost is strictly
+        # increasing in R_GAC (required_BV's cubic has a negative-discriminant derivative,
+        # so it is strictly decreasing in R_GAC -> higher removal means a shorter bed life
+        # and more carbon), so LCOW minimization drives removal down until this binds.
+        #
+        # NOTE: this states the spec as hand-solved algebra, which bakes in "only BAF and
+        # GAC remove TOC" and "only these four units lose water" -- true of the current
+        # yamls, but a yaml edit would silently invalidate it. Restating it directly on
+        # treated_nonRO (as the RO trains do, via _add_product_toc_limit) removes that
+        # coupling and gives the same optimum. Its one measured cost is warm-start reach:
+        # this form references the feed concentration directly, so it tracks a feed-TOC
+        # continuation through coarse steps, while the product-stream form made a 2 mg/L
+        # step fail from a warm start (a single re-solve recovers the same optimum).
         if hasattr(non_RO, "total_toc_removal"):
             non_RO.del_component("total_toc_removal")
         non_RO.total_toc_removal = Constraint(
             m.fs.time,
             rule=lambda b, t: (1 - non_RO.GAC.removal_frac_mass_comp[t, "toc"]) * (
-                    1 - non_RO.BAF.removal_frac_mass_comp[t, "toc"]) ==
+                    1 - non_RO.BAF.removal_frac_mass_comp[t, "toc"]) <=
                               toc_eff / (m.fs.feed.conc_mass_comp[t, "toc"] / (
                     non_RO.Ozone.recovery_frac_mass_H2O[t] * non_RO.BAF.recovery_frac_mass_H2O[t] *
                     non_RO.UF.recovery_frac_mass_H2O[t] * non_RO.GAC.recovery_frac_mass_H2O[t]))
@@ -1309,9 +1409,14 @@ def optimize_operation(m, state = None, effluent_type = None, treatment_train = 
         if treatment_train != "IPR":  # IPR has no ozone/BAC to optimize
             _setup_ozone_optimization(non_RO, state)
 
+            # Bounds are bare numbers, in the variable's own declared units (minutes),
+            # matching the CBAT branch and the GAC bounds. Writing 20*pyunits.minute
+            # reads as safer but is not: setlb/setub do not check units, they just take
+            # the magnitude -- so if EBCT were ever redeclared in seconds, that form
+            # would silently become a 20-SECOND bound instead of raising.
             non_RO.BAF.EBCT[0].unfix()
-            non_RO.BAF.EBCT[0].setlb(20 * pyunits.minute)
-            non_RO.BAF.EBCT[0].setub(30 * pyunits.minute)
+            non_RO.BAF.EBCT[0].setlb(20)
+            non_RO.BAF.EBCT[0].setub(30)
 
             non_RO.BAF.removal_frac_mass_comp[0, "toc"].unfix()
             non_RO.BAF.removal_frac_mass_comp[0, "toc"].setlb(0.0)
@@ -1428,11 +1533,20 @@ def optimize_operation(m, state = None, effluent_type = None, treatment_train = 
         # non_RO.Cl.contact_time[0].setlb(30)
         # non_RO.Cl.contact_time[0].setub(60)
 
-        if treatment_train != "IPR":  # IPR TOC is met by RO rejection alone (no BAF/ozone constraint)
+        if treatment_train != "IPR":  # IPR has no BAF/ozone, so no BAF removal correlation
             _add_baf_toc_removal_constraint(m, non_RO)
+
+        # Finished-water TOC spec. Both RO trains meet it on RO rejection alone, so this
+        # is slack at the optimum -- it enforces compliance rather than driving the design.
+        _add_product_toc_limit(m, non_RO, state, m.fs.treated_RO)
 
     # m.fs.objective = Objective(expr=m.fs.LCOT_wo_revenue)
     # m.fs.objective = Objective(expr=m.fs.LCOW_wo_revenue)
+    # Guarded like the constraints above so re-optimizing a model in place (the sweep
+    # calls optimize_operation on an already-optimized model) replaces the objective
+    # explicitly instead of tripping Pyomo's implicit-replacement warning.
+    if hasattr(m.fs, "objective"):
+        m.fs.del_component("objective")
     m.fs.objective = Objective(expr=m.fs.LCOW)
 
     return
