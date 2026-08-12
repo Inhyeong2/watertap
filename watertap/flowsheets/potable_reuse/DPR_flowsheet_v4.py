@@ -75,6 +75,7 @@ from watertap.core.membrane_channel_base import ModuleType
 
 from watertap.core.zero_order_properties import WaterParameterBlock
 from watertap.core.wt_database import Database
+from watertap.unit_models.zero_order.ozone_DPR_zo import check_LRV_attainable
 from watertap.unit_models.zero_order import (
     FeedZO,
     OzoneDPRZO,
@@ -405,6 +406,7 @@ def build_nonRO(working_directory="module", state=None, solute_list=None, efflue
 
     # define flowsheet inlets and outlets
     m.fs.feed = FeedZO(property_package=m.fs.prop_zo)
+    _check_ozone_lrv(effluent_type, LRVO3_req)
     non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
                               LRVO3_required=LRVO3_req)
     non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
@@ -479,6 +481,7 @@ def build_RO(working_directory="module", state=None, solute_list=None, effluent_
     # a design assumption to be verified against the current regulation before citing it.
     is_ipr = (treatment_train == "IPR")
     if not is_ipr:
+        _check_ozone_lrv(effluent_type, LRVO3_req)
         non_RO.Ozone = OzoneDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state, effluent_type=effluent_type,
                                   LRVO3_required=LRVO3_req)
         non_RO.BAF = BioActiveFiltrationDPRZO(property_package=m.fs.prop_zo, database=m.db, state=state)
@@ -1169,6 +1172,33 @@ def initialize_system(m, treatment_train = None):
 
     return
 
+# Ozone contactor operating envelope. Declared here (not in the unit model) because
+# these are flowsheet design choices, not properties of the CT relationship:
+#   HRT   5-15 min  -- SI: ozone contactor HRT typically <= 15 min
+#   O3:TOC 0.5-1.0  -- CA pins 1.0; the other states use 0.5 as a floor
+# The same numbers bound the variables and feed the LRV feasibility check, so a
+# widened bound automatically widens what the check accepts.
+OZONE_HRT_MIN, OZONE_HRT_MAX = 5.0, 15.0
+OZONE_O3TOC_MIN, OZONE_O3TOC_MAX = 0.5, 1.0
+
+
+def _check_ozone_lrv(effluent_type, LRVO3_req):
+    """Reject an ozone LRV the contactor cannot deliver, at build time.
+
+    The unit model already rejects an LRV above the asymptotic CT ceiling (that is a
+    property of the decay kinetics). This adds the bound-aware half: an LRV that is
+    reachable in principle but needs more contact time than OZONE_HRT_MAX allows.
+    Without it the run only fails later as an IPOPT infeasibility with no indication
+    that the LRV requirement was the cause.
+    """
+    check_LRV_attainable(
+        effluent_type,
+        LRVO3_req,
+        o3_to_toc_max=OZONE_O3TOC_MAX,
+        hrt_max=OZONE_HRT_MAX,
+    )
+
+
 def _init_ozone_hrt(non_RO, state):
     # Initialization DOF for the ozone contactor HRT. For CA the HRT is determined
     # by the model (ca_hrt_ct_constraint, since O3:TOC is pinned at 1.0), so it is
@@ -1176,11 +1206,11 @@ def _init_ozone_hrt(non_RO, state):
     # design point so the square initialization solve is well-posed.
     O = non_RO.Ozone
     if state == "CA":
-        O.contact_time[0].set_value(7)
-        O.contact_time[0].setlb(5)
-        O.contact_time[0].setub(15)
+        O.contact_time[0].set_value(0.5 * (OZONE_HRT_MIN + OZONE_HRT_MAX))
+        O.contact_time[0].setlb(OZONE_HRT_MIN)
+        O.contact_time[0].setub(OZONE_HRT_MAX)
     else:
-        O.contact_time[0].fix(5)
+        O.contact_time[0].fix(OZONE_HRT_MIN)
 
 
 def _setup_ozone_optimization(non_RO, state):
@@ -1191,13 +1221,13 @@ def _setup_ozone_optimization(non_RO, state):
     #  - CO/FL/AZ: O3:TOC is free within [0.5, 1.0] and traded against the HRT along
     #    the model's O3toTOC_ratio_constraint by the LCOW objective.
     non_RO.Ozone.contact_time[0].unfix()
-    non_RO.Ozone.contact_time[0].setlb(5)
-    non_RO.Ozone.contact_time[0].setub(15)  # SI: ozone contactor HRT typically <= 15 min
+    non_RO.Ozone.contact_time[0].setlb(OZONE_HRT_MIN)
+    non_RO.Ozone.contact_time[0].setub(OZONE_HRT_MAX)
 
     if state != "CA":
         non_RO.Ozone.O3toTOC[0].unfix()
-        non_RO.Ozone.O3toTOC[0].setlb(0.5)
-        non_RO.Ozone.O3toTOC[0].setub(1)
+        non_RO.Ozone.O3toTOC[0].setlb(OZONE_O3TOC_MIN)
+        non_RO.Ozone.O3toTOC[0].setub(OZONE_O3TOC_MAX)
 
 def _baf_toc_removal_expr(non_RO, t):
     """BAF TOC removal correlation: a coded factorial regression in the upstream

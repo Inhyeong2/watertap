@@ -49,6 +49,102 @@ from watertap.core import build_siso, ZeroOrderBaseData
 __author__ = "Inhyeong Jeon"
 
 
+# --------------------------------------------------------------------------- #
+# Correlation coefficients -- single source of truth                            #
+# --------------------------------------------------------------------------- #
+# First-order ozone decay constant k [1/min] as a linear function of the O3:TOC
+# ratio, calibrated separately for secondary and tertiary effluent (Gerrity data
+# over r = 0.5-1.0). Secondary effluent carries more TOC, so ozone decays faster
+# (larger k) and less CT is attainable from the same dose.
+_K_COEFFS = {"TERTIARY": (-0.6422, 0.8342), "SECONDARY": (-0.2637, 0.5251)}
+# Ozone residual 30 s after application, C_30s = _C30_SLOPE*r + _C30_INTERCEPT
+# [mg/L] (Pang et al., 2023).
+_C30_SLOPE, _C30_INTERCEPT = 0.704, 1.136
+# Required Cryptosporidium exposure per log reduction [mg.min/L].
+_CT_PER_LRV = 2.47
+# Duration of the instantaneous-ozone-demand window [min]; the residual sits at
+# C_30s over it and decays first-order afterwards.
+_IOD_MIN = 0.5
+# Design minimum contactor HRT [min]. CA's ca_hrt_ct_constraint floors the solved
+# contact time here: if 5 min already exceeds CTreq the HRT stays at 5 rather than
+# shrinking below the design minimum.
+_HRT_FLOOR_MIN = 5.0
+
+
+def decay_constant(o3_to_toc, effluent_type):
+    """First-order ozone decay constant k [1/min]. Plain floats, no Pyomo."""
+    try:
+        slope, intercept = _K_COEFFS[effluent_type.upper()]
+    except KeyError:
+        raise ConfigurationError(f"Unsupported effluent_type: {effluent_type}")
+    return slope * o3_to_toc + intercept
+
+
+def achieved_CT(contact_time, o3_to_toc, effluent_type):
+    """CT [mg.min/L] achieved over ``contact_time`` [min]. Plain floats.
+
+    Mirrors the ``CT_achieved`` Pyomo Expression built below; kept in sync by
+    sharing the coefficients above. ``contact_time=None`` returns the asymptotic
+    ceiling as contact_time -> infinity.
+    """
+    import math
+
+    k = decay_constant(o3_to_toc, effluent_type)
+    c30 = _C30_SLOPE * o3_to_toc + _C30_INTERCEPT
+    if contact_time is None:  # tau -> inf, the exponential term vanishes
+        return c30 * (_IOD_MIN + 1.0 / k)
+    return c30 * (_IOD_MIN + (1.0 - math.exp(-k * (contact_time - _IOD_MIN))) / k)
+
+
+def check_LRV_attainable(effluent_type, LRV, o3_to_toc_max=1.0, hrt_max=None):
+    """Raise ConfigurationError if the required Cryptosporidium LRV cannot be met.
+
+    Ozone decays first order, so the exposure integral converges: CT saturates at
+    ``C_30s * (0.5 + 1/k)`` no matter how long the contactor is. A required LRV
+    above that ceiling is unreachable at *any* contact time and any tank size --
+    without this check it surfaces only as an IPOPT "converged to a locally
+    infeasible point" after a full build and initialization, with nothing pointing
+    at the LRV as the cause.
+
+    Two separate failures are reported:
+      * above the asymptotic ceiling -> impossible in principle;
+      * reachable in principle but needing more contact time than ``hrt_max``
+        -> a bound the caller could raise. Pass ``hrt_max=None`` to skip it.
+
+    ``o3_to_toc_max`` is the largest dose the caller allows (CA pins it at 1.0;
+    the other states cap it there too). CT is increasing in the dose -- a larger
+    ratio raises C_30s and lowers k -- so evaluating at the maximum is the correct
+    best case.
+    """
+    if LRV is None:
+        return
+    ct_req = _CT_PER_LRV * LRV
+    ct_ceiling = achieved_CT(None, o3_to_toc_max, effluent_type)
+    k = decay_constant(o3_to_toc_max, effluent_type)
+    if ct_req > ct_ceiling:
+        raise ConfigurationError(
+            f"LRVO3_required={LRV} needs CT = {ct_req:.2f} mg.min/L, but "
+            f"{effluent_type.upper()} effluent at O3:TOC={o3_to_toc_max:g} caps the "
+            f"attainable CT at {ct_ceiling:.2f} mg.min/L (first-order decay "
+            f"k={k:.4f} 1/min; CT saturates as contact time grows). This LRV is not "
+            f"reachable at any contact time. Reduce the ozone LRV requirement or "
+            f"credit the shortfall to another barrier."
+        )
+    if hrt_max is not None and achieved_CT(hrt_max, o3_to_toc_max, effluent_type) < ct_req:
+        import math
+
+        # Invert CT(tau) = ct_req for the contact time actually needed.
+        c30 = _C30_SLOPE * o3_to_toc_max + _C30_INTERCEPT
+        tau_req = _IOD_MIN - math.log(1.0 - k * (ct_req / c30 - _IOD_MIN)) / k
+        raise ConfigurationError(
+            f"LRVO3_required={LRV} needs CT = {ct_req:.2f} mg.min/L, which "
+            f"{effluent_type.upper()} effluent at O3:TOC={o3_to_toc_max:g} reaches only "
+            f"at a contact time of {tau_req:.2f} min -- above the {hrt_max:g} min upper "
+            f"bound. Raise the contact-time bound to at least {tau_req:.2f} min, or "
+            f"reduce the ozone LRV requirement."
+        )
+
+
 @declare_process_block_class("OzoneDPRZO")
 class OzoneDPRZOData(ZeroOrderBaseData):
     """
@@ -147,23 +243,24 @@ class OzoneDPRZOData(ZeroOrderBaseData):
         # First-order ozone decay constant as a (linear) function of the O3:TOC
         # ratio; distinct calibration for secondary vs tertiary effluent. This is
         # now actually used by the O3:TOC constraint below.
-        if self.config.effluent_type.upper() == "SECONDARY":
-            self.kO3 = pyo.Expression(
-                self.flowsheet().time,
-                rule=lambda b, t: (-0.2637 * b.O3toTOC[t] + 0.5251) * (1 / pyunits.min),
-                doc="Reaction rate constant for secondary effluent",
-            )
-
-        elif self.config.effluent_type.upper() == "TERTIARY":
-            self.kO3 = pyo.Expression(
-                self.flowsheet().time,
-                rule=lambda b, t: (-0.6422 * b.O3toTOC[t] + 0.8342) * (1 / pyunits.min),
-                doc="Reaction rate constant for tertiary effluent",
-            )
-        else:
+        if self.config.effluent_type.upper() not in _K_COEFFS:
             raise ConfigurationError(
                 f"Unsupported effluent_type: {self.config.effluent_type}"
             )
+        _k_slope, _k_int = _K_COEFFS[self.config.effluent_type.upper()]
+        self.kO3 = pyo.Expression(
+            self.flowsheet().time,
+            rule=lambda b, t: (_k_slope * b.O3toTOC[t] + _k_int) * (1 / pyunits.min),
+            doc=f"Reaction rate constant for {self.config.effluent_type.lower()} effluent",
+        )
+
+        # Fail fast on a required LRV the CT relationship cannot deliver, instead of
+        # letting it surface as an opaque IPOPT infeasibility after a full build.
+        # Bound-independent check only (asymptotic ceiling); the flowsheet applies the
+        # contact-time-bound check, since it owns those bounds.
+        check_LRV_attainable(
+            self.config.effluent_type, self.config.LRVO3_required
+        )
 
         self.nitrite = pyo.Expression(
             self.flowsheet().time,
@@ -178,10 +275,10 @@ class OzoneDPRZOData(ZeroOrderBaseData):
         # pinned at 1.0 and the HRT is set here (see ca_hrt_ct_constraint).
         self.CT_achieved = pyo.Expression(
             self.flowsheet().time,
-            rule=lambda b, t: (0.704 * b.O3toTOC[t] + 1.136) * (pyunits.mg / pyunits.L) * (
-                0.5 * pyunits.min + pyunits.convert(
+            rule=lambda b, t: (_C30_SLOPE * b.O3toTOC[t] + _C30_INTERCEPT) * (pyunits.mg / pyunits.L) * (
+                _IOD_MIN * pyunits.min + pyunits.convert(
                     (1 - pyo.exp(pyunits.convert(
-                        -b.kO3[t] * (b.contact_time[t] - 0.5 * pyunits.min),
+                        -b.kO3[t] * (b.contact_time[t] - _IOD_MIN * pyunits.min),
                         to_units=pyunits.dimensionless))) / b.kO3[t],
                     to_units=pyunits.min)),
             doc="Achieved Cryptosporidium CT (mg.min/L)",
@@ -191,21 +288,21 @@ class OzoneDPRZOData(ZeroOrderBaseData):
         def O3toTOC_ratio_constraint(b, t):
             state = b.config.state
             LRV = b.config.LRVO3_required
-            # No explicit LRV cap: a required LRV that cannot be met within the
-            # O3:TOC and HRT bounds simply makes the problem infeasible (the O3:TOC
-            # equality would need a value above its upper bound, or the CA CT
-            # inequality cannot be satisfied), which surfaces as a solve failure.
-            CTreq = 2.47 * LRV * pyunits.mg * pyunits.min / pyunits.L
+            # An LRV above the asymptotic CT ceiling is rejected at build time by
+            # check_LRV_attainable; an LRV that merely needs more contact time than the
+            # flowsheet's bound allows is rejected by the flowsheet, which owns that
+            # bound. Anything surviving both is reachable here.
+            CTreq = _CT_PER_LRV * LRV * pyunits.mg * pyunits.min / pyunits.L
             k = b.kO3[t]
             exp_term = pyo.exp(pyunits.convert(
-                -k * (b.contact_time[t] - 0.5 * pyunits.min), to_units=pyunits.dimensionless
+                -k * (b.contact_time[t] - _IOD_MIN * pyunits.min), to_units=pyunits.dimensionless
             ))
             denom = pyunits.convert(
-                0.5 * pyunits.min * k + (1 - exp_term), to_units=pyunits.dimensionless
+                _IOD_MIN * pyunits.min * k + (1 - exp_term), to_units=pyunits.dimensionless
             )
             # O3:TOC required to meet the Cryptosporidium CT target.
-            expr1 = (CTreq * k / denom - 1.136 * pyunits.mg / pyunits.L) / (
-                0.704 * pyunits.mg / pyunits.L
+            expr1 = (CTreq * k / denom - _C30_INTERCEPT * pyunits.mg / pyunits.L) / (
+                _C30_SLOPE * pyunits.mg / pyunits.L
             )
 
             if state == "CA":
@@ -239,12 +336,12 @@ class OzoneDPRZOData(ZeroOrderBaseData):
             def ca_hrt_ct_constraint(b, t):
                 LRV = b.config.LRVO3_required
                 CTU = pyunits.mg * pyunits.min / pyunits.L
-                CTreq = 2.47 * LRV
+                CTreq = _CT_PER_LRV * LRV
                 exp_ref = pyo.exp(pyunits.convert(
-                    -b.kO3[t] * (5 * pyunits.min - 0.5 * pyunits.min),
+                    -b.kO3[t] * (_HRT_FLOOR_MIN * pyunits.min - _IOD_MIN * pyunits.min),
                     to_units=pyunits.dimensionless))
-                CT_ref = (0.704 * b.O3toTOC[t] + 1.136) * (pyunits.mg / pyunits.L) * (
-                    0.5 * pyunits.min + pyunits.convert(
+                CT_ref = (_C30_SLOPE * b.O3toTOC[t] + _C30_INTERCEPT) * (pyunits.mg / pyunits.L) * (
+                    _IOD_MIN * pyunits.min + pyunits.convert(
                         (1 - exp_ref) / b.kO3[t], to_units=pyunits.min))
                 return b.CT_achieved[t] / CTU == smooth_max(CTreq, CT_ref / CTU)
 
