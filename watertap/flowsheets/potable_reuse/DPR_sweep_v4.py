@@ -1,11 +1,12 @@
 """
-Multi-variable warm-start parameter sweep for DPR_flowsheet_v2.
+Multi-variable warm-start parameter sweep for DPR_flowsheet_v4.
 
-Improvements over DPR_sweep_v1 (which only swept feed flow):
+Improvements over DPR_sweep_v1 (which only swept feed flow); these carried forward
+through v2/v3 into this version:
 
   1. Declarative, name-based sweep targets. Sweeps are specified as
      ``{handle_name: (min, max, nx)}`` and resolved through
-     ``DPR_flowsheet_v2.get_sweep_handles`` -- so a multi-variable sweep never has to
+     ``DPR_flowsheet_v4.get_sweep_handles`` -- so a multi-variable sweep never has to
      hard-code model paths like ``m.fs.RO_main.RO.A_comp[0, "H2O"]``. Any number of
      handles can be combined; parameter_sweep takes the Cartesian product, and the
      reused model warm-starts each sample from the previous one.
@@ -19,13 +20,20 @@ Improvements over DPR_sweep_v1 (which only swept feed flow):
      cannot conflict with an ``optimize_operation`` bound; and warns which decision
      variables are being fixed (the result is no longer cost-optimal in those).
 
-Like v1, each sample is solved with the plain ``DPR_flowsheet_v2.solve`` (warm start
+Like v1, each sample is solved with the plain ``DPR_flowsheet_v4.solve`` (warm start
 + the solver's own autoscaling). Per-sample rescaling was tried and dropped -- it did
-not help and made the flow sweep worse (see DPR_flowsheet_v2 docstring).
+not help and made the flow sweep worse (see the DPR_flowsheet docstring).
+
+A warm-started grid can still drop samples when consecutive points are far apart --
+a coarse feed-flow grid over the full 1-100 MGD range is the usual case. Those points
+are not unsolvable: ``_solve_single_point`` rebuilds a fresh model at the sample and
+scales it there, and the rescue pass (on by default in ``run_monte_carlo``) recovers
+them to the same optimum a fine grid finds. Use ``rescue=True`` for any sampling whose
+points are not densely spaced.
 
 Example (2-D sweep over feed flow x feed TDS)::
 
-    from watertap.flowsheets.potable_reuse.DPR_sweep_v2 import run_sweep, MGD
+    from watertap.flowsheets.potable_reuse.DPR_sweep_v4 import run_sweep, MGD
     run_sweep(
         state="CA", treatment_train="RBAT",
         sweep_config={
@@ -45,10 +53,15 @@ from parameter_sweep import (
     parameter_sweep,
 )
 from idaes.core.util.model_statistics import degrees_of_freedom
-# Spiral RO + added RO design constraints (flux<=20 LMH, v_exit>=0.1, length 6-8).
-# This sweep is identical to DPR_sweep_v2 except it builds the spiral flowsheet, so the
+# Spiral RO + added RO design constraints (flux<=20 LMH, v_exit>=0.1, length 6-8), so the
 # RBAT LCOW reflects the spiral/constrained RO. Output files carry a distinct tag so they
 # do not overwrite the flat-RO Monte Carlo results.
+#
+# This sweep differs from DPR_sweep_v3 only in what it builds: DPR_flowsheet_v4 (the
+# theoretical-CT ozone model, OzoneDPRZO) instead of v3 (the polynomial OzoneDPRZOv0),
+# and the ``state`` argument that v4's set_operating_conditions needs to decide whether
+# the ozone HRT is fixed or left to the model. Passing no state would silently take the
+# fixed-5-min branch for CA, where the HRT is supposed to be solved.
 import watertap.flowsheets.potable_reuse.DPR_flowsheet_v4 as dpr
 
 # Number of RO stages for the multi-stage RBAT flowsheet (single feed pump + retentate
@@ -69,7 +82,9 @@ def _resolve_output_path(output_filename, sweep_config, state, treatment_train):
     own directory is respected as-is. None -> auto-named file in OUTPUT_DIR."""
     if output_filename is None:
         tag = "_".join(sweep_config.keys())
-        output_filename = f"sweep_v2_{state}_{treatment_train}_{tag}.csv"
+        # TAG, not a hardcoded version literal: run_sweep from v2/v3/v4 otherwise
+        # auto-names the SAME file and silently overwrites the older version's results.
+        output_filename = f"sweep_{TAG}_{state}_{treatment_train}_{tag}.csv"
     # If the caller gave just a filename (no directory), place it in OUTPUT_DIR.
     if os.path.dirname(output_filename) == "":
         output_filename = os.path.join(OUTPUT_DIR, output_filename)
@@ -201,13 +216,13 @@ def run_sweep(
     interpolate_nan_outputs=True,
     verbose=True,
 ):
-    """Run a (multi-variable) sweep over DPR_flowsheet_v2.
+    """Run a (multi-variable) sweep over DPR_flowsheet_v4.
 
     Parameters
     ----------
     sweep_config : dict
         ``{handle_name: (min, max, nx)}``. ``handle_name`` is any key returned by
-        ``DPR_flowsheet_v2.get_sweep_handles``. Defaults to the v1 behavior
+        ``DPR_flowsheet_v4.get_sweep_handles``. Defaults to the v1 behavior
         (feed flow, 1-100 MGD, 21 points) when None.
     output_filename : str, optional
         Where to write the CSV. None -> auto-named file in ``OUTPUT_DIR``
@@ -508,7 +523,7 @@ def run_monte_carlo(
     verbose=True,
     predetermined=None,
 ):
-    """Run a Monte Carlo (random uniform) sampling over DPR_flowsheet_v2.
+    """Run a Monte Carlo (random uniform) sampling over DPR_flowsheet_v4.
 
     Unlike ``run_sweep`` (which sweeps a deterministic Cartesian grid), this draws
     ``num_samples`` independent uniform random samples for each target and solves the
@@ -519,7 +534,7 @@ def run_monte_carlo(
     ----------
     mc_config : dict, optional
         ``{handle_name: (min, max)}``. ``handle_name`` is any key returned by
-        ``DPR_flowsheet_v2.get_sweep_handles``. Defaults to ``DEFAULT_MC_CONFIG``
+        ``DPR_flowsheet_v4.get_sweep_handles``. Defaults to ``DEFAULT_MC_CONFIG``
         (CA case study: system capacity 1-100 MGD, feed TOC 7-15 mg/L, feed TDS
         500-1000 mg/L, brine disposal cost 0.05-0.66 $/m3).
     num_samples : int
@@ -579,7 +594,8 @@ def run_monte_carlo(
 
     if output_filename is None:
         tag = "_".join(mc_config.keys())
-        output_filename = f"mc_v2_{state}_{treatment_train}_n{num_samples}_{tag}.csv"
+        # TAG for the same reason as in _resolve_output_path.
+        output_filename = f"mc_{TAG}_{state}_{treatment_train}_n{num_samples}_{tag}.csv"
     if os.path.dirname(output_filename) == "":
         output_filename = os.path.join(OUTPUT_DIR, output_filename)
     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
@@ -653,7 +669,7 @@ def run_monte_carlo_multistate(
     ----------
     states : iterable of str
         States to run (default CA, CO, FL). Each must be supported by
-        ``DPR_flowsheet_v2.DPR_initial_setting`` (CA / CO / FL / AZ).
+        ``DPR_flowsheet_v4.DPR_initial_setting`` (CA / CO / FL / AZ).
     output_dir : str, optional
         Directory for the per-state CSV/PNG. Default ``OUTPUT_DIR/monte_carlo``.
 
@@ -683,7 +699,7 @@ def run_monte_carlo_multistate(
         if verbose:
             print(f"\n=== Monte Carlo: state={state}, train={treatment_train} ===")
         csv = os.path.join(
-            output_dir, f"mc_v2_{state}_{treatment_train}_{TAG}_n{num_samples}.csv"
+            output_dir, f"mc_{TAG}_{state}_{treatment_train}_n{num_samples}.csv"
         )
         _gr, csv_path, _png = run_monte_carlo(
             state=state,
