@@ -1,9 +1,12 @@
 default:
   energy_electric_flow_vol_inlet:
-    value: 1.41003732 # Plumlee et al. Energy cost ($M/year) = 0.1509 * flow rate (MGD) --> 1.41003732 kWh/m3
+    value: 0.141003732 # Plumlee et al. Energy cost ($M/year) = 0.01509 * flow rate (MGD) --> 0.141003732 kWh/m3
     units: kWh/m^3
   energy_membrane_replacement_flow_vol_inlet:
     value: 0.31396457 # Plumlee et al. Energy cost ($M/year) = 0.0336 * flow rate (MGD) --> 0.31396457 kWh/m3
+    units: kWh/m^3
+  energy_chemical_consumption_flow_vol_inlet:
+    value: 0.80920631 # Plumlee et al. Energy cost ($M/year) = 0.0866 * flow rate (MGD) -->  0.80920631 kWh/m3
     units: kWh/m^3
   capital_cost:
     cost_factor: None
