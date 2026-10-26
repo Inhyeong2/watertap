@@ -1338,7 +1338,7 @@ def optimize_operation(m, state = None, effluent_type = None, treatment_train = 
         _setup_ozone_optimization(non_RO, state)
 
         non_RO.BAF.EBCT[0].unfix()
-        non_RO.BAF.EBCT[0].setlb(20)
+        non_RO.BAF.EBCT[0].setlb(15)
         non_RO.BAF.EBCT[0].setub(30)
 
         non_RO.BAF.removal_frac_mass_comp[0, "toc"].unfix()
